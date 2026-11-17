@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import weakref
 from collections.abc import Callable
 from dataclasses import replace
@@ -10,7 +11,7 @@ from uuid import uuid4
 from PyQt6 import sip
 from PyQt6.QtCore import (
     QObject, QRunnable, QLibraryInfo, QLocale, QRectF, QStandardPaths, QThreadPool,
-    QTimer, QTranslator, Qt, QUrl, pyqtSignal,
+    QTimer, QTranslator, Qt, QUrl, QSize, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPainterPath, QPixmap, QShortcut,
@@ -20,7 +21,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFrame, QGridLayout,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
-    QSlider, QSplitter, QTabBar, QVBoxLayout, QWidget,
+    QSlider, QSplitter, QStackedWidget, QSystemTrayIcon, QTabBar, QVBoxLayout, QWidget,
 )
 
 from .api import BilibiliClient
@@ -89,7 +90,11 @@ def media_icon(kind: str, theme: str, primary: bool = False) -> QIcon:
     color = QColor("#202635" if primary else PALETTES[theme]["text"])
     painter.setPen(Qt.PenStyle.NoPen)
     painter.setBrush(color)
-    if kind == "pause":
+    if kind == "queue":
+        for y in (4, 10, 16):
+            painter.drawRoundedRect(3, y, 3, 3, 1, 1)
+            painter.drawRoundedRect(8, y, 12, 3, 1, 1)
+    elif kind == "pause":
         painter.drawRoundedRect(5, 4, 4, 14, 1, 1)
         painter.drawRoundedRect(13, 4, 4, 14, 1, 1)
     else:
@@ -142,10 +147,11 @@ class CoverButton(QPushButton):
                                        Qt.TransformationMode.SmoothTransformation)
             painter.drawPixmap((self.width() - image.width()) // 2,
                                (self.height() - image.height()) // 2, image)
-            painter.fillRect(0, self.height() - 33, self.width(), 33, QColor(0, 0, 0, 125))
-            painter.setPen(QColor("#ffffff"))
-            painter.drawText(self.rect().adjusted(12, 0, -12, -7),
-                             Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft, self.caption)
+            if self.caption:
+                painter.fillRect(0, self.height() - 33, self.width(), 33, QColor(0, 0, 0, 125))
+                painter.setPen(QColor("#ffffff"))
+                painter.drawText(self.rect().adjusted(12, 0, -12, -7),
+                                 Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft, self.caption)
         else:
             painter.setPen(QColor(p["accent"]))
             font = QFont(self.font())
@@ -156,6 +162,14 @@ class CoverButton(QPushButton):
         if self.hasFocus():
             painter.setPen(QColor(p["accent"]))
             painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 8, 8)
+
+
+class PlayerPages(QStackedWidget):
+    def minimumSizeHint(self):
+        return QSize(0, 0)
+
+    def sizeHint(self):
+        return self.currentWidget().sizeHint() if self.currentWidget() else QSize(0, 0)
 
 
 class MainWindow(QMainWindow):
@@ -185,6 +199,16 @@ class MainWindow(QMainWindow):
         self._library_request = 0
         self._queue_epoch = 0
         self._closing = False
+        self._quitting = False
+        self._mini_mode = False
+        self._normal_geometry = None
+        self._normal_maximized = False
+        self._want_playing = False
+        self._loading_stream = False
+        self._resume_position: int | None = None
+        self._last_played_position = 0
+        self._last_progress_at = time.monotonic()
+        self._reconnect_attempts = 0
         self._tasks: set[Task] = set()
         self._save_error_shown = False
         self._cover_pixmaps: dict[str, QPixmap] = {}
@@ -200,12 +224,19 @@ class MainWindow(QMainWindow):
         self.player.setAudioOutput(self.audio)
         apply_theme(QApplication.instance(), self.theme)
         self._build(volume)
+        self._build_mini()
+        self._build_tray()
         self._append_tracks(tracks, persist=False)
         self.player.positionChanged.connect(self._position)
         self.player.durationChanged.connect(self._duration)
         self.player.playbackStateChanged.connect(self._playback_state)
         self.player.mediaStatusChanged.connect(self._media_status)
         self.player.errorOccurred.connect(self._media_error)
+        self.player.seekableChanged.connect(lambda seekable: QTimer.singleShot(0, self._resume_stream) if seekable else None)
+        self.playback_watchdog = QTimer(self)
+        self.playback_watchdog.setInterval(1000)
+        self.playback_watchdog.timeout.connect(self._check_playback_progress)
+        self.playback_watchdog.start()
         self._shortcut = QShortcut(QKeySequence("Space"), self)
         self._shortcut.activated.connect(self.toggle_play)
         self.save_timer = QTimer(self)
@@ -235,7 +266,9 @@ class MainWindow(QMainWindow):
     def _build(self, volume):
         root = QWidget()
         root.setObjectName("root")
-        self.setCentralWidget(root)
+        self.pages = PlayerPages()
+        self.setCentralWidget(self.pages)
+        self.pages.addWidget(root)
         outer = QVBoxLayout(root)
         outer.setContentsMargins(26, 20, 26, 18)
         outer.setSpacing(16)
@@ -258,6 +291,9 @@ class MainWindow(QMainWindow):
         self._bind(self.language_combo, "语言", "setToolTip")
         self.language_combo.currentIndexChanged.connect(lambda: self.set_language(self.language_combo.currentData()))
         header.addWidget(self.language_combo)
+        self.collapse_button = self._button("折叠", lambda: self.set_mini_mode(True))
+        self._bind(self.collapse_button, "切换到迷你播放器", "setToolTip")
+        header.addWidget(self.collapse_button)
         outer.addLayout(header)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(14)
@@ -274,6 +310,9 @@ class MainWindow(QMainWindow):
         filter_row = QHBoxLayout()
         self.tabs = QTabBar()
         self.tabs.setDrawBase(False)
+        self.tabs.setUsesScrollButtons(False)
+        self.tabs.setExpanding(False)
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         for _ in range(3):
             self.tabs.addTab("")
         self.tabs.currentChanged.connect(self._render_library)
@@ -304,6 +343,7 @@ class MainWindow(QMainWindow):
         panel.setMinimumWidth(260)
         panel.setMaximumWidth(390)
         queue_layout = QVBoxLayout(panel)
+        self.queue_layout = queue_layout
         queue_layout.setContentsMargins(16, 18, 16, 16)
         queue_header = QHBoxLayout()
         self.queue_title = label(name="section")
@@ -383,6 +423,214 @@ class MainWindow(QMainWindow):
         controls.addLayout(progress)
         outer.addWidget(player_frame)
 
+    def _build_mini(self):
+        mini = QWidget()
+        mini.setObjectName("root")
+        layout = QVBoxLayout(mini)
+        layout.setContentsMargins(20, 16, 20, 20)
+        layout.setSpacing(12)
+        header = QHBoxLayout()
+        header.addWidget(label("bili music", "section"))
+        header.addStretch()
+        self.expand_button = self._button("展开", lambda: self.set_mini_mode(False))
+        self._bind(self.expand_button, "返回完整播放器", "setToolTip")
+        header.addWidget(self.expand_button)
+        layout.addLayout(header)
+        self.mini_cover = CoverButton("", self.theme)
+        self.mini_cover.setMinimumSize(240, 240)
+        self.mini_cover.setMaximumHeight(16777215)
+        self.mini_cover.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.mini_cover.clicked.connect(self.toggle_play)
+        self._bind(self.mini_cover, "播放 / 暂停（空格）", "setToolTip")
+        layout.addWidget(self.mini_cover, 1)
+        self.mini_title = label(name="section")
+        self.mini_title.setWordWrap(True)
+        self.mini_title.setMaximumHeight(60)
+        self.mini_title.setMinimumWidth(0)
+        layout.addWidget(self.mini_title)
+        self.mini_meta = label(name="muted")
+        self.mini_meta.setWordWrap(True)
+        self.mini_meta.setMaximumHeight(40)
+        layout.addWidget(self.mini_meta)
+        self.mini_seek = QSlider(Qt.Orientation.Horizontal)
+        self.mini_seek.setRange(0, 0)
+        self.mini_seek.setEnabled(False)
+        self.mini_seek.sliderReleased.connect(lambda: self.player.setPosition(self.mini_seek.value()))
+        self.mini_seek.sliderMoved.connect(lambda value: self.mini_elapsed.setText(timestamp(value)))
+        self.player.seekableChanged.connect(self.mini_seek.setEnabled)
+        layout.addWidget(self.mini_seek)
+        times = QHBoxLayout()
+        self.mini_elapsed, self.mini_total = label("0:00", "muted"), label("0:00", "muted")
+        times.addWidget(self.mini_elapsed)
+        times.addStretch()
+        times.addWidget(self.mini_total)
+        layout.addLayout(times)
+        controls = QHBoxLayout()
+        controls.setSpacing(3)
+        # A spacer has no adjacent layout gap; include it to balance the queue button.
+        controls.addSpacing(47)
+        controls.addStretch()
+        self.mini_previous = button("", self.previous)
+        self.mini_play = button("", self.toggle_play, True)
+        self.mini_next = button("", self.next)
+        for widget, text in ((self.mini_previous, "上一首"),
+                             (self.mini_play, "播放 / 暂停（空格）"),
+                             (self.mini_next, "下一首")):
+            widget.setFixedSize(56, 44)
+            self._bind(widget, text, "setToolTip")
+            controls.addWidget(widget)
+        controls.addStretch()
+        self.mini_queue_button = button("", self.toggle_mini_queue)
+        self.mini_queue_button.setFixedSize(44, 44)
+        self.mini_queue_button.setCheckable(True)
+        self._bind(self.mini_queue_button, "展开 / 收起播放队列", "setToolTip")
+        self._bind(self.mini_queue_button, "播放队列", "setAccessibleName")
+        controls.addWidget(self.mini_queue_button)
+        layout.addLayout(controls)
+        self.mini_queue_panel = QFrame()
+        self.mini_queue_panel.setObjectName("queuePanel")
+        self.mini_queue_panel.setFixedHeight(220)
+        self.mini_queue_layout = QVBoxLayout(self.mini_queue_panel)
+        self.mini_queue_layout.setContentsMargins(12, 10, 12, 10)
+        queue_header = QHBoxLayout()
+        self.mini_queue_title = label(name="section")
+        queue_header.addWidget(self.mini_queue_title)
+        queue_header.addStretch()
+        queue_header.addWidget(self._button("清空", self.clear_queue))
+        self.mini_queue_layout.addLayout(queue_header)
+        self.mini_queue_empty = self._text("还没有歌曲，去音乐库选一首吧。", "muted")
+        self.mini_queue_empty.setWordWrap(True)
+        self.mini_queue_layout.addWidget(self.mini_queue_empty)
+        layout.addWidget(self.mini_queue_panel)
+        self.mini_queue_panel.hide()
+        self._mini_queue_open = False
+        self._mini_collapsed_size = QSize(360, 560)
+        self._mini_queue_extra = self.mini_queue_panel.height() + layout.spacing()
+        self.pages.addWidget(mini)
+        self._refresh_mini_theme()
+
+    def toggle_mini_queue(self):
+        if not self._mini_mode:
+            return
+        self._mini_queue_open = not self._mini_queue_open
+        self.mini_queue_button.setChecked(self._mini_queue_open)
+        if self._mini_queue_open:
+            self._mini_collapsed_size = self.size()
+            self.mini_queue_panel.show()
+            self.setMinimumSize(320, 500 + self._mini_queue_extra)
+            self.resize(self.width(), self._mini_collapsed_size.height() + self._mini_queue_extra)
+            current = self.queue.currentItem()
+            if current is not None:
+                self.queue.scrollToItem(current)
+        else:
+            self.mini_queue_panel.hide()
+            self.setMinimumSize(320, 500)
+            self.resize(self.width(), self._mini_collapsed_size.height())
+
+    def _refresh_mini_theme(self):
+        self.mini_cover.theme = self.theme
+        self.mini_cover.update()
+        self.mini_previous.setIcon(media_icon("previous", self.theme))
+        self.mini_next.setIcon(media_icon("next", self.theme))
+        self.mini_queue_button.setIcon(media_icon("queue", self.theme))
+        playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        self.mini_play.setIcon(media_icon("pause" if playing else "play", self.theme, primary=True))
+
+    def set_mini_mode(self, enabled: bool):
+        if enabled == self._mini_mode:
+            return
+        self._mini_mode = enabled
+        if enabled:
+            self._normal_maximized = self.isMaximized()
+            self._normal_geometry = self.normalGeometry() if self._normal_maximized else self.geometry()
+            self.showNormal()
+            self.pages.setCurrentIndex(1)
+            self.mini_queue_layout.insertWidget(1, self.queue, 1)
+            self.queue.show()
+            extra = self._mini_queue_extra if self._mini_queue_open else 0
+            self.setMinimumSize(320, 500 + extra)
+            self.resize(360, 560 + extra)
+            self._mini_collapsed_size = QSize(360, 560)
+        else:
+            self.queue_layout.insertWidget(2, self.queue, 1)
+            self.queue.show()
+            self.pages.setCurrentIndex(0)
+            self.setMinimumSize(1020, 700)
+            if self._normal_geometry is not None:
+                self.setGeometry(self._normal_geometry)
+            if self._normal_maximized:
+                self.showMaximized()
+        self._sync_mini_text()
+
+    def _sync_mini_text(self):
+        self.mini_title.setText(self.now_title.text())
+        self.mini_title.setToolTip(self.now_title.text())
+        self.mini_meta.setText(self.now_meta.text())
+        self.mini_cover.setAccessibleName(self.now_title.text())
+        self.tray.setToolTip(("Bili Music · " + self.now_title.text())[:127])
+
+    def _update_current_cover(self, track=None):
+        # Detach the previous song's pending cover before reusing this artwork widget.
+        self.mini_cover.set_pixmap(QPixmap())
+        for waiters in self._cover_waiters.values():
+            waiters[:] = [ref for ref in waiters if ref() is not self.mini_cover]
+        if track is None:
+            return
+        entry = next((e for e in self.entries if any(t.id == track.id for t in e.tracks)), None)
+        if entry is None:
+            entry = next((e for e in self.entries if any(
+                (t.bvid, t.cid) == (track.bvid, track.cid) for t in e.tracks)), None)
+        if entry and entry.cover:
+            self._load_cover(entry.cover, self.mini_cover)
+
+    def _build_tray(self):
+        self.tray = QSystemTrayIcon(self)
+        icon = QPixmap(64, 64)
+        icon.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(icon)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor(PALETTES[self.theme]["accent"]))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(2, 2, 60, 60, 16, 16)
+        painter.drawPixmap(10, 10, 44, 44, media_icon("play", self.theme).pixmap(44, 44))
+        painter.end()
+        self.setWindowIcon(QIcon(icon))
+        self.tray.setIcon(self.windowIcon())
+        menu = QMenu(self)
+        self._bind(menu.addAction(""), "显示播放器").triggered.connect(self.restore_window)
+        self._bind(menu.addAction(""), "迷你播放器").triggered.connect(self.show_mini_player)
+        menu.addSeparator()
+        self._bind(menu.addAction(""), "播放 / 暂停（空格）").triggered.connect(self.toggle_play)
+        self._bind(menu.addAction(""), "上一首").triggered.connect(self.previous)
+        self._bind(menu.addAction(""), "下一首").triggered.connect(self.next)
+        menu.addSeparator()
+        self._bind(menu.addAction(""), "退出").triggered.connect(self.quit_application)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._tray_activated)
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.show()
+
+    def _tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.restore_window()
+
+    def restore_window(self):
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def show_mini_player(self):
+        self.set_mini_mode(True)
+        self.restore_window()
+
+    def quit_application(self):
+        self._quitting = True
+        self.close()
+        QApplication.instance().quit()
+
     def _retranslate(self):
         self.setWindowTitle(self.tr("Bili Music · B站音乐播放器"))
         app = QApplication.instance()
@@ -401,6 +649,7 @@ class MainWindow(QMainWindow):
         if self.current_id is None:
             self.now_title.setText(self.tr("还没有正在播放的音乐"))
             self.now_meta.setText(self.tr("从音乐库点击播放"))
+        self._sync_mini_text()
         self._status(*self._status_value[:1], **self._status_value[1])
         self._queue_changed(persist=False)
         self._render_library()
@@ -417,6 +666,7 @@ class MainWindow(QMainWindow):
         self.next_button.setIcon(media_icon("next", self.theme))
         playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
         self.play_button.setIcon(media_icon("pause" if playing else "play", self.theme, primary=True))
+        self._refresh_mini_theme()
         self._render_library()
         self._save()
 
@@ -754,7 +1004,9 @@ class MainWindow(QMainWindow):
 
     def _queue_changed(self, *_, persist=True):
         self.queue_title.setText(self.tr("播放队列 · {count}", count=self.queue.count()))
+        self.mini_queue_title.setText(self.queue_title.text())
         self.queue_empty.setVisible(self.queue.count() == 0)
+        self.mini_queue_empty.setVisible(self.queue.count() == 0)
         if persist:
             self._save()
 
@@ -762,30 +1014,105 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         track = item.data(Qt.ItemDataRole.UserRole)
+        self._reset_playback_recovery()
+        self._want_playing = True
+        self._loading_stream = True
         self._request += 1
-        request = self._request
         self.player.stop()
         self.player.setSource(QUrl())
         self.current_id = track.id
         self.queue.setCurrentItem(item)
         self.now_title.setText(track.title)
         self.now_meta.setText(f"{track.artist or track.bvid} · P{track.page}")
+        self._sync_mini_text()
+        self._update_current_cover(track)
         self._status("正在获取音频地址…")
+
+        self._load_stream(track)
+
+    def _reset_playback_recovery(self):
+        self._want_playing = False
+        self._loading_stream = False
+        self._resume_position = None
+        self._last_played_position = 0
+        self._reconnect_attempts = 0
+        self._last_progress_at = time.monotonic()
+
+    def _load_stream(self, track):
+        request = self._request
+        self._loading_stream = True
+        self._last_progress_at = time.monotonic()
 
         def done(url):
             if request != self._request or track.id != self.current_id:
                 return
             self.player.setSource(QUrl(self.proxy.set_stream(url)))
-            self.player.play()
-            self._status("正在缓冲音频…")
+            self._loading_stream = False
+            self._last_progress_at = time.monotonic()
+            QTimer.singleShot(0, self._resume_stream)
+            if self._want_playing:
+                self.player.play()
+                self._status("正在缓冲音频…")
 
-        self._submit(lambda: BilibiliClient().get_stream(track), done,
-                     lambda message: self._error(message) if request == self._request else None)
+        def failed(message):
+            if request != self._request or track.id != self.current_id:
+                return
+            self._loading_stream = False
+            if self._reconnect_attempts:
+                self._recover_stream()
+            else:
+                self._want_playing = False
+                self._error(message)
+
+        self._submit(lambda: BilibiliClient().get_stream(track), done, failed)
+
+    def _resume_stream(self):
+        if self._resume_position is not None and self.player.isSeekable():
+            position = self._resume_position
+            self._resume_position = None
+            self.player.setPosition(position)
+            self._last_progress_at = time.monotonic()
+
+    def _recover_stream(self):
+        row = self._current_row()
+        if self._closing or not self._want_playing or row < 0 or self._loading_stream:
+            return
+        if self._reconnect_attempts >= 3:
+            self._want_playing = False
+            self.player.pause()
+            self._status("音频重连失败，请检查网络后点击播放重试。")
+            return
+        self._reconnect_attempts += 1
+        if self._resume_position is None:
+            self._resume_position = self._last_played_position
+        self._request += 1
+        self._loading_stream = True
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self._status("播放中断，正在重新连接（{attempt}/3）…", attempt=self._reconnect_attempts)
+        self._load_stream(self.queue.item(row).data(Qt.ItemDataRole.UserRole))
+
+    def _check_playback_progress(self):
+        if self._closing or not self._want_playing or not self.current_id or self._loading_stream:
+            return
+        if self.player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
+            return
+        if time.monotonic() - self._last_progress_at >= 20:
+            self._recover_stream()
 
     def toggle_play(self):
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+        if self._want_playing or self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._want_playing = False
             self.player.pause()
+        elif self.current_id and (self._resume_position is not None or self._reconnect_attempts >= 3):
+            self._want_playing = True
+            self._reconnect_attempts = 0
+            self._recover_stream()
+        elif self.current_id and self._loading_stream:
+            self._want_playing = True
         elif self.current_id and self.player.source().isValid() and self.player.mediaStatus() != QMediaPlayer.MediaStatus.InvalidMedia:
+            self._want_playing = True
+            self._last_progress_at = time.monotonic()
             self.player.play()
         else:
             self.play_item(self.queue.currentItem() or self.queue.item(0))
@@ -811,6 +1138,7 @@ class MainWindow(QMainWindow):
         self.play_item(self.queue.item(next_row))
 
     def clear_queue(self):
+        self._reset_playback_recovery()
         self._request += 1
         self._library_request += 1
         self._queue_epoch += 1
@@ -820,6 +1148,8 @@ class MainWindow(QMainWindow):
         self.queue.clear()
         self.now_title.setText(self.tr("还没有正在播放的音乐"))
         self.now_meta.setText(self.tr("从音乐库点击播放"))
+        self._sync_mini_text()
+        self._update_current_cover()
         self._status("队列已清空")
         self._queue_changed()
 
@@ -838,6 +1168,7 @@ class MainWindow(QMainWindow):
             is_current = item.data(Qt.ItemDataRole.UserRole).id == self.current_id
             self.queue.takeItem(row)
             if is_current:
+                self._reset_playback_recovery()
                 self._request += 1
                 self.player.stop()
                 self.player.setSource(QUrl())
@@ -847,33 +1178,52 @@ class MainWindow(QMainWindow):
                 else:
                     self.now_title.setText(self.tr("还没有正在播放的音乐"))
                     self.now_meta.setText(self.tr("从音乐库点击播放"))
+                    self._sync_mini_text()
+                    self._update_current_cover()
             self._queue_changed()
 
     def _position(self, position):
-        if not self.seek.isSliderDown():
-            self.seek.setValue(position)
-            self.elapsed.setText(timestamp(position))
+        if not self._loading_stream and self._resume_position is None and position > 0:
+            if position != self._last_played_position:
+                self._last_progress_at = time.monotonic()
+            self._last_played_position = position
+        for slider, elapsed in ((self.seek, self.elapsed), (self.mini_seek, self.mini_elapsed)):
+            if not slider.isSliderDown():
+                slider.setValue(position)
+                elapsed.setText(timestamp(position))
 
     def _duration(self, duration):
-        self.seek.setRange(0, duration)
-        self.total.setText(timestamp(duration))
+        for slider, total in ((self.seek, self.total), (self.mini_seek, self.mini_total)):
+            slider.setRange(0, duration)
+            total.setText(timestamp(duration))
 
     def _playback_state(self, state):
-        self.play_button.setIcon(media_icon(
-            "pause" if state == QMediaPlayer.PlaybackState.PlayingState else "play", self.theme, primary=True,
-        ))
+        for widget in (self.play_button, self.mini_play):
+            widget.setIcon(media_icon(
+                "pause" if state == QMediaPlayer.PlaybackState.PlayingState else "play", self.theme, primary=True,
+            ))
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self._status("正在播放")
         elif state == QMediaPlayer.PlaybackState.PausedState:
             self._status("已暂停")
 
     def _media_status(self, status):
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+        if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia):
+            QTimer.singleShot(0, self._resume_stream)
+        elif status == QMediaPlayer.MediaStatus.EndOfMedia:
+            duration = self.player.duration()
+            if self._want_playing and duration > 0 and self._last_played_position + 2000 < duration:
+                self._recover_stream()
+                return
+            self._want_playing = False
             self.next(automatic=True)
 
     def _media_error(self, error, message):
         if error != QMediaPlayer.Error.NoError and self.current_id:
-            self._status("播放失败：{message}。可重新双击歌曲获取地址。", message=message)
+            if self._want_playing:
+                self._recover_stream()
+            else:
+                self._status("播放失败：{message}。可重新双击歌曲获取地址。", message=message)
 
     def _volume(self, value):
         self.audio.setVolume(value / 100)
@@ -897,7 +1247,17 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Bili Music", message)
 
     def closeEvent(self, event):
+        if not self._quitting and QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.show()
+            self.save_timer.stop()
+            self._save()
+            self.hide()
+            event.ignore()
+            return
         self._closing = True
+        self.playback_watchdog.stop()
+        self._reset_playback_recovery()
+        self.tray.hide()
         self._request += 1
         self.save_timer.stop()
         self._save()

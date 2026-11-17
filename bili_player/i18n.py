@@ -4,6 +4,12 @@ from __future__ import annotations
 import re
 
 ENGLISH = {
+    "播放中断，正在重新连接（{attempt}/3）…": "Playback interrupted. Reconnecting ({attempt}/3)…",
+    "音频重连失败，请检查网络后点击播放重试。": "Could not reconnect. Check your network and press Play to retry.",
+    "播放队列": "Play queue", "展开 / 收起播放队列": "Show / Hide play queue",
+    "折叠": "Collapse", "展开": "Expand",
+    "切换到迷你播放器": "Switch to mini player", "返回完整播放器": "Return to full player",
+    "显示播放器": "Show player", "迷你播放器": "Mini player", "退出": "Quit",
     "Bili Music · B站音乐播放器": "Bili Music · Bilibili Music Player",
     "让喜欢的声音，陪你久一点": "Keep your favorite sounds close",
     "＋ 导入 BV": "+ Import BV",
