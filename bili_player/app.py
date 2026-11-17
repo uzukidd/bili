@@ -10,26 +10,34 @@ from uuid import uuid4
 
 from PyQt6 import sip
 from PyQt6.QtCore import (
-    QObject, QRunnable, QLibraryInfo, QLocale, QRectF, QStandardPaths, QThreadPool,
+    QObject, QRunnable, QLibraryInfo, QLocale, QRectF, QStandardPaths, QThreadPool, QEvent, QPoint,
     QTimer, QTranslator, Qt, QUrl, QSize, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPainterPath, QPixmap, QShortcut,
+    QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QShortcut,
 )
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QFrame, QGridLayout,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
     QSlider, QSplitter, QStackedWidget, QSystemTrayIcon, QTabBar, QVBoxLayout, QWidget,
 )
 
 from .api import BilibiliClient
+from .catalog import normalize_library, merge_libraries, find_song, delete_song
+from .cards import CardArtwork, LibraryCard, LibraryGrid
 from .covers import CoverCache
+from .details import EntryDetailsDialog
 from .dialogs import AlbumDialog, EntryDialog
+from .exchange import read_library, write_library
 from .i18n import translate, translate_error
+from .list_dialog import ListImportDialog
 from .models import LibraryEntry, Store, Track
+from .playback_order import ShuffleOrder
+from .window_chrome import TitleBar, FramelessController
 from .stream import StreamProxy
+from .widgets import SeekSlider
 from .theme import PALETTES, apply_theme, stylesheet
 
 STYLE = stylesheet("light")
@@ -78,8 +86,8 @@ def timestamp(ms: int) -> str:
 
 
 def copy_tracks(tracks: list[Track]) -> list[Track]:
-    """An album, its source single, and each queue item own separate identities."""
-    return [replace(track, id=str(uuid4())) for track in tracks]
+    """Queue occurrences have their own IDs and retain the song entity ID."""
+    return [replace(track, id=str(uuid4()), song_id=track.song_id or track.id) for track in tracks]
 
 
 def media_icon(kind: str, theme: str, primary: bool = False) -> QIcon:
@@ -90,7 +98,45 @@ def media_icon(kind: str, theme: str, primary: bool = False) -> QIcon:
     color = QColor("#202635" if primary else PALETTES[theme]["text"])
     painter.setPen(Qt.PenStyle.NoPen)
     painter.setBrush(color)
-    if kind == "queue":
+    if kind.startswith("mode"):
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(color, 1.7))
+        mode = int(kind[-1])
+        if mode == 3:
+            for points in (((3, 5), (7, 5), (15, 17), (20, 17)), ((3, 17), (7, 17), (15, 5), (20, 5))):
+                path = QPainterPath()
+                path.moveTo(*points[0])
+                for point in points[1:]:
+                    path.lineTo(*point)
+                painter.drawPath(path)
+            for y in (5, 17):
+                painter.drawLine(17, y - 3, 20, y)
+                painter.drawLine(17, y + 3, 20, y)
+        elif mode == 0:
+            painter.drawLine(3, 11, 20, 11)
+            painter.drawLine(15, 6, 20, 11)
+            painter.drawLine(15, 16, 20, 11)
+        else:
+            painter.drawRoundedRect(QRectF(3, 5, 16, 12), 4, 4)
+            painter.drawLine(15, 2, 19, 5)
+            painter.drawLine(15, 8, 19, 5)
+            if mode == 2:
+                font = painter.font()
+                font.setPixelSize(9)
+                painter.setFont(font)
+                painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "1")
+    elif kind == "pin":
+        path = QPainterPath()
+        path.moveTo(7, 3)
+        path.lineTo(15, 3)
+        path.lineTo(14, 9)
+        path.lineTo(18, 14)
+        path.lineTo(4, 14)
+        path.lineTo(8, 9)
+        path.closeSubpath()
+        painter.drawPath(path)
+        painter.drawRect(10, 14, 2, 6)
+    elif kind == "queue":
         for y in (4, 10, 16):
             painter.drawRoundedRect(3, y, 3, 3, 1, 1)
             painter.drawRoundedRect(8, y, 12, 3, 1, 1)
@@ -173,8 +219,11 @@ class PlayerPages(QStackedWidget):
 
 
 class MainWindow(QMainWindow):
+    libraryChanged = pyqtSignal()
+
     def __init__(self, store_path: Path | None = None):
         super().__init__()
+        self._frameless_controller = FramelessController(self)
         self.resize(1220, 820)
         self.setMinimumSize(1020, 700)
         if store_path is None:
@@ -191,6 +240,10 @@ class MainWindow(QMainWindow):
             load_error = str(exc)
         self.theme = self.store.settings["theme"]
         self.language = self.store.settings["language"]
+        self.card_scale = float(self.store.settings.get("card_scale", 1.0))
+        self._saved_play_mode = self.store.settings.get("play_mode", 0)
+        self.shuffle_order = ShuffleOrder()
+        self._play_next_priority = []
         self._bindings = []
         self._status_value = ("准备就绪 · 添加 BV 号，开始收集你的音乐", {})
         self._qt_translator = QTranslator(self)
@@ -201,6 +254,10 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._quitting = False
         self._mini_mode = False
+        self._always_on_top = False
+        self._library_drag_group = str(uuid4())
+        self._library_drag_active = False
+        self._library_render_pending = False
         self._normal_geometry = None
         self._normal_maximized = False
         self._want_playing = False
@@ -214,6 +271,7 @@ class MainWindow(QMainWindow):
         self._cover_pixmaps: dict[str, QPixmap] = {}
         self._cover_waiters: dict[str, list] = {}
         self._editing_albums: set[str] = set()
+        self._song_edit_requests = {}
         self._deferred_album_additions: dict[str, list] = {}
         self.covers = CoverCache(self.store.path.parent / "covers")
         self.pool = QThreadPool.globalInstance()
@@ -267,15 +325,23 @@ class MainWindow(QMainWindow):
         root = QWidget()
         root.setObjectName("root")
         self.pages = PlayerPages()
-        self.setCentralWidget(self.pages)
+        shell = QWidget()
+        shell.setObjectName("root")
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(1, 1, 1, 1)
+        shell_layout.setSpacing(0)
+        self.title_bar = TitleBar(self, self.language)
+        shell_layout.addWidget(self.title_bar)
+        shell_layout.addWidget(self.pages, 1)
+        self.setCentralWidget(shell)
         self.pages.addWidget(root)
         outer = QVBoxLayout(root)
         outer.setContentsMargins(26, 20, 26, 18)
         outer.setSpacing(16)
         header = QHBoxLayout()
-        header.addWidget(label("bili music", "brand"))
+        header.addWidget(label("BILI music", "brand"))
         header.addSpacing(12)
-        header.addWidget(self._text("让喜欢的声音，陪你久一点", "muted"))
+        header.addWidget(self._text("Basic Integrated Listening Infrastructure", "muted"))
         header.addStretch()
         self.theme_combo = QComboBox()
         self.theme_combo.addItem("", "light")
@@ -291,6 +357,8 @@ class MainWindow(QMainWindow):
         self._bind(self.language_combo, "语言", "setToolTip")
         self.language_combo.currentIndexChanged.connect(lambda: self.set_language(self.language_combo.currentData()))
         header.addWidget(self.language_combo)
+        self.pin_button = self._make_pin_button()
+        header.addWidget(self.pin_button)
         self.collapse_button = self._button("折叠", lambda: self.set_mini_mode(True))
         self._bind(self.collapse_button, "切换到迷你播放器", "setToolTip")
         header.addWidget(self.collapse_button)
@@ -305,6 +373,7 @@ class MainWindow(QMainWindow):
         title_row.addWidget(self._text("我的音乐库", "heading"))
         title_row.addStretch()
         title_row.addWidget(self._button("＋ 新建专辑", self.new_album))
+        title_row.addWidget(self._button("导入列表", self.import_list))
         title_row.addWidget(self._button("＋ 导入 BV", self.add_entry, True))
         lib_layout.addLayout(title_row)
         filter_row = QHBoxLayout()
@@ -318,6 +387,9 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._render_library)
         filter_row.addWidget(self.tabs)
         filter_row.addStretch()
+        self.json_button = button("JSON", self.show_json_menu)
+        self._bind(self.json_button, "导入或导出全部曲目", "setToolTip")
+        filter_row.addWidget(self.json_button)
         self.search = QLineEdit()
         self._bind(self.search, "搜索名称 / BV", "setPlaceholderText")
         self.search.setClearButtonEnabled(True)
@@ -329,12 +401,12 @@ class MainWindow(QMainWindow):
         lib_layout.addWidget(self.library_count)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        self.cards = QWidget()
-        self.cards.setObjectName("cards")
-        self.grid = QGridLayout(self.cards)
-        self.grid.setContentsMargins(0, 0, 8, 12)
-        self.grid.setSpacing(16)
-        self.grid.setAlignment(Qt.AlignmentFlag.AlignTop)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.cards = LibraryGrid()
+        self.cards.set_scroll_area(scroll)
+        self.cards.set_scale(self.card_scale)
+        self.cards.scaleChanged.connect(self.set_card_scale)
+        self.grid = self.cards.grid
         scroll.setWidget(self.cards)
         lib_layout.addWidget(scroll, 1)
         splitter.addWidget(library)
@@ -398,7 +470,9 @@ class MainWindow(QMainWindow):
         self._bind(self.next_button, "下一首", "setToolTip")
         top.addWidget(self.next_button)
         self.mode = QComboBox()
-        self.mode.addItems(["", "", ""])
+        self.mode.addItems(["", "", "", ""])
+        self.mode.setCurrentIndex(self._saved_play_mode if type(self._saved_play_mode) is int and 0 <= self._saved_play_mode < 4 else 0)
+        self.mode.currentIndexChanged.connect(self._mode_changed)
         top.addWidget(self.mode)
         top.addSpacing(10)
         top.addWidget(self._text("音量", "muted"))
@@ -411,10 +485,10 @@ class MainWindow(QMainWindow):
         controls.addLayout(top)
         progress = QHBoxLayout()
         self.elapsed, self.total = label("0:00", "muted"), label("0:00", "muted")
-        self.seek = QSlider(Qt.Orientation.Horizontal)
+        self.seek = SeekSlider()
         self.seek.setRange(0, 0)
         self.seek.setEnabled(False)
-        self.seek.sliderReleased.connect(lambda: self.player.setPosition(self.seek.value()))
+        self.seek.seekRequested.connect(self._seek_to)
         self.seek.sliderMoved.connect(lambda value: self.elapsed.setText(timestamp(value)))
         self.player.seekableChanged.connect(self.seek.setEnabled)
         progress.addWidget(self.elapsed)
@@ -425,6 +499,8 @@ class MainWindow(QMainWindow):
 
     def _build_mini(self):
         mini = QWidget()
+        self.mini_surface = mini
+        mini.installEventFilter(self)
         mini.setObjectName("root")
         layout = QVBoxLayout(mini)
         layout.setContentsMargins(20, 16, 20, 20)
@@ -432,6 +508,8 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         header.addWidget(label("bili music", "section"))
         header.addStretch()
+        self.mini_pin_button = self._make_pin_button()
+        header.addWidget(self.mini_pin_button)
         self.expand_button = self._button("展开", lambda: self.set_mini_mode(False))
         self._bind(self.expand_button, "返回完整播放器", "setToolTip")
         header.addWidget(self.expand_button)
@@ -452,10 +530,10 @@ class MainWindow(QMainWindow):
         self.mini_meta.setWordWrap(True)
         self.mini_meta.setMaximumHeight(40)
         layout.addWidget(self.mini_meta)
-        self.mini_seek = QSlider(Qt.Orientation.Horizontal)
+        self.mini_seek = SeekSlider()
         self.mini_seek.setRange(0, 0)
         self.mini_seek.setEnabled(False)
-        self.mini_seek.sliderReleased.connect(lambda: self.player.setPosition(self.mini_seek.value()))
+        self.mini_seek.seekRequested.connect(self._seek_to)
         self.mini_seek.sliderMoved.connect(lambda value: self.mini_elapsed.setText(timestamp(value)))
         self.player.seekableChanged.connect(self.mini_seek.setEnabled)
         layout.addWidget(self.mini_seek)
@@ -467,8 +545,11 @@ class MainWindow(QMainWindow):
         layout.addLayout(times)
         controls = QHBoxLayout()
         controls.setSpacing(3)
-        # A spacer has no adjacent layout gap; include it to balance the queue button.
-        controls.addSpacing(47)
+        self.mini_mode_button = button("", self.show_playback_modes)
+        self.mini_mode_button.setFixedSize(44, 44)
+        self.mini_mode_button.setProperty("flatIcon", True)
+        self.mini_mode_button.setFlat(True)
+        controls.addWidget(self.mini_mode_button)
         controls.addStretch()
         self.mini_previous = button("", self.previous)
         self.mini_play = button("", self.toggle_play, True)
@@ -482,14 +563,16 @@ class MainWindow(QMainWindow):
         controls.addStretch()
         self.mini_queue_button = button("", self.toggle_mini_queue)
         self.mini_queue_button.setFixedSize(44, 44)
+        self.mini_queue_button.setProperty("flatIcon", True)
+        self.mini_queue_button.setFlat(True)
         self.mini_queue_button.setCheckable(True)
         self._bind(self.mini_queue_button, "展开 / 收起播放队列", "setToolTip")
         self._bind(self.mini_queue_button, "播放队列", "setAccessibleName")
         controls.addWidget(self.mini_queue_button)
         layout.addLayout(controls)
-        self.mini_queue_panel = QFrame()
-        self.mini_queue_panel.setObjectName("queuePanel")
-        self.mini_queue_panel.setFixedHeight(220)
+        self.mini_queue_panel = QFrame(mini)
+        self.mini_queue_panel.setObjectName("queueOverlay")
+        self.mini_queue_panel.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.mini_queue_layout = QVBoxLayout(self.mini_queue_panel)
         self.mini_queue_layout.setContentsMargins(12, 10, 12, 10)
         queue_header = QHBoxLayout()
@@ -501,31 +584,120 @@ class MainWindow(QMainWindow):
         self.mini_queue_empty = self._text("还没有歌曲，去音乐库选一首吧。", "muted")
         self.mini_queue_empty.setWordWrap(True)
         self.mini_queue_layout.addWidget(self.mini_queue_empty)
-        layout.addWidget(self.mini_queue_panel)
         self.mini_queue_panel.hide()
         self._mini_queue_open = False
-        self._mini_collapsed_size = QSize(360, 560)
-        self._mini_queue_extra = self.mini_queue_panel.height() + layout.spacing()
+        self._queue_overlay_filter = False
         self.pages.addWidget(mini)
         self._refresh_mini_theme()
 
-    def toggle_mini_queue(self):
-        if not self._mini_mode:
+    def _mode_changed(self, _index=None):
+        self.shuffle_order.reset()
+        self.shuffle_order.record(self.current_id)
+        self._refresh_mode_button()
+        if hasattr(self, "save_timer"):
+            self.save_timer.start(200)
+
+    def _refresh_mode_button(self):
+        if not hasattr(self, "mini_mode_button"):
             return
-        self._mini_queue_open = not self._mini_queue_open
-        self.mini_queue_button.setChecked(self._mini_queue_open)
+        names = ("顺序播放", "列表循环", "单曲循环", "随机播放")
+        index = self.mode.currentIndex()
+        self.mini_mode_button.setText("")
+        self.mini_mode_button.setIcon(media_icon(f"mode{index}", self.theme))
+        self.mini_mode_button.setToolTip(self.tr("播放模式：{mode}", mode=self.tr(names[index])))
+        self.mini_mode_button.setAccessibleName(self.tr(names[index]))
+
+    def show_playback_modes(self):
+        menu = QMenu(self)
+        for index, text in enumerate(("顺序播放", "列表循环", "单曲循环", "随机播放")):
+            action = menu.addAction(self.tr(text))
+            action.setCheckable(True)
+            action.setChecked(self.mode.currentIndex() == index)
+            action.triggered.connect(lambda _checked=False, value=index: self.mode.setCurrentIndex(value))
+        menu.exec(self.mini_mode_button.mapToGlobal(self.mini_mode_button.rect().topLeft()))
+        menu.deleteLater()
+
+    def _make_pin_button(self):
+        widget = button("", lambda: self.set_always_on_top(not self._always_on_top))
+        widget.setCheckable(True)
+        widget.setProperty("flatIcon", True)
+        widget.setFlat(True)
+        widget.setFixedSize(36, 34)
+        return widget
+
+    def _refresh_pin_buttons(self):
+        hint = self.tr("取消置顶" if self._always_on_top else "置顶播放器")
+        for widget in (self.pin_button, self.mini_pin_button):
+            widget.setChecked(self._always_on_top)
+            widget.setToolTip(hint)
+            widget.setAccessibleName(hint)
+            widget.setIcon(media_icon("pin", self.theme))
+
+    def set_always_on_top(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled == self._always_on_top:
+            return
+        visible, state, geometry = self.isVisible(), self.windowState(), self.geometry()
+        self._always_on_top = enabled
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
+        self.setGeometry(geometry)
+        self.setWindowState(state)
+        if visible:
+            self.show()
+        self._refresh_pin_buttons()
+
+    def _position_mini_queue(self):
+        if sip.isdeleted(self) or self._closing or not hasattr(self, "mini_queue_panel") or not self._mini_mode:
+            return
+        surface = self.mini_surface
+        bottom = self.mini_play.mapTo(surface, QPoint(0, 0)).y() - 8
+        top_limit = self.expand_button.mapTo(surface, self.expand_button.rect().bottomLeft()).y() + 12
+        height = max(80, min(300, bottom - top_limit))
+        self.mini_queue_panel.setGeometry(20, max(top_limit, bottom - height),
+                                          max(1, surface.width() - 40), height)
         if self._mini_queue_open:
-            self._mini_collapsed_size = self.size()
-            self.mini_queue_panel.show()
-            self.setMinimumSize(320, 500 + self._mini_queue_extra)
-            self.resize(self.width(), self._mini_collapsed_size.height() + self._mini_queue_extra)
+            self.mini_queue_panel.raise_()
+
+    def _set_mini_queue_open(self, opened: bool):
+        self._mini_queue_open = opened
+        self.mini_queue_button.setChecked(opened)
+        self._position_mini_queue()
+        self.mini_queue_panel.setVisible(opened and self._mini_mode)
+        app = QApplication.instance()
+        if opened and not self._queue_overlay_filter:
+            app.installEventFilter(self)
+            self._queue_overlay_filter = True
+        elif not opened and self._queue_overlay_filter:
+            app.removeEventFilter(self)
+            self._queue_overlay_filter = False
+        if opened:
+            self.mini_queue_panel.raise_()
             current = self.queue.currentItem()
             if current is not None:
                 self.queue.scrollToItem(current)
-        else:
-            self.mini_queue_panel.hide()
-            self.setMinimumSize(320, 500)
-            self.resize(self.width(), self._mini_collapsed_size.height())
+
+    def toggle_mini_queue(self):
+        if self._mini_mode:
+            self._set_mini_queue_open(not self._mini_queue_open)
+
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, "mini_surface", None) and event.type() in (QEvent.Type.Resize, QEvent.Type.LayoutRequest):
+            QTimer.singleShot(0, self._position_mini_queue)
+        if getattr(self, "_mini_queue_open", False):
+            if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape:
+                self._set_mini_queue_open(False)
+                return True
+            if event.type() == QEvent.Type.MouseButtonPress:
+                point = event.globalPosition().toPoint()
+                panel = self.mini_queue_panel
+                on_panel = panel.rect().contains(panel.mapFromGlobal(point))
+                on_button = self.mini_queue_button.rect().contains(self.mini_queue_button.mapFromGlobal(point))
+                if not on_panel and not on_button:
+                    self._set_mini_queue_open(False)
+                    # Dismiss clicks on the cover must not also toggle playback.
+                    if isinstance(watched, QWidget) and watched.window() is self:
+                        return True
+        return super().eventFilter(watched, event)
 
     def _refresh_mini_theme(self):
         self.mini_cover.theme = self.theme
@@ -533,6 +705,8 @@ class MainWindow(QMainWindow):
         self.mini_previous.setIcon(media_icon("previous", self.theme))
         self.mini_next.setIcon(media_icon("next", self.theme))
         self.mini_queue_button.setIcon(media_icon("queue", self.theme))
+        self._refresh_mode_button()
+        self._refresh_pin_buttons()
         playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
         self.mini_play.setIcon(media_icon("pause" if playing else "play", self.theme, primary=True))
 
@@ -547,11 +721,11 @@ class MainWindow(QMainWindow):
             self.pages.setCurrentIndex(1)
             self.mini_queue_layout.insertWidget(1, self.queue, 1)
             self.queue.show()
-            extra = self._mini_queue_extra if self._mini_queue_open else 0
-            self.setMinimumSize(320, 500 + extra)
-            self.resize(360, 560 + extra)
-            self._mini_collapsed_size = QSize(360, 560)
+            self.setMinimumSize(320, 500)
+            self.resize(360, 560)
+            QTimer.singleShot(0, self._position_mini_queue)
         else:
+            self._set_mini_queue_open(False)
             self.queue_layout.insertWidget(2, self.queue, 1)
             self.queue.show()
             self.pages.setCurrentIndex(0)
@@ -576,7 +750,9 @@ class MainWindow(QMainWindow):
             waiters[:] = [ref for ref in waiters if ref() is not self.mini_cover]
         if track is None:
             return
-        entry = next((e for e in self.entries if any(t.id == track.id for t in e.tracks)), None)
+        entry = find_song(self.entries, track.song_id) if track.song_id else None
+        if entry is None:
+            entry = next((e for e in self.entries if any(t.id == track.id for t in e.tracks)), None)
         if entry is None:
             entry = next((e for e in self.entries if any(
                 (t.bvid, t.cid) == (track.bvid, track.cid) for t in e.tracks)), None)
@@ -642,14 +818,17 @@ class MainWindow(QMainWindow):
             getattr(widget, method)(self.tr(text))
         for index, text in enumerate(("全部", "专辑", "单曲")):
             self.tabs.setTabText(index, self.tr(text))
-        for index, text in enumerate(("顺序播放", "列表循环", "单曲循环")):
+        for index, text in enumerate(("顺序播放", "列表循环", "单曲循环", "随机播放")):
             self.mode.setItemText(index, self.tr(text))
+        self.title_bar.set_language(self.language)
+        self._refresh_mode_button()
         for index, text in enumerate(("白天模式", "夜晚模式")):
             self.theme_combo.setItemText(index, self.tr(text))
         if self.current_id is None:
             self.now_title.setText(self.tr("还没有正在播放的音乐"))
             self.now_meta.setText(self.tr("从音乐库点击播放"))
         self._sync_mini_text()
+        self._refresh_pin_buttons()
         self._status(*self._status_value[:1], **self._status_value[1])
         self._queue_changed(persist=False)
         self._render_library()
@@ -670,6 +849,12 @@ class MainWindow(QMainWindow):
         self._render_library()
         self._save()
 
+    def set_card_scale(self, value: float):
+        self.cards.set_scale(value)
+        self.card_scale = self.cards.scale
+        if hasattr(self, "save_timer"):
+            self.save_timer.start(350)
+
     def set_language(self, language: str):
         if language == self.language:
             return
@@ -684,16 +869,28 @@ class MainWindow(QMainWindow):
         self._status_value = (text, values)
         self.status.setText(self.tr(text, **values))
 
+    def _card_drag_state(self, active: bool):
+        self._library_drag_active = active
+        if not active and self._library_render_pending and not self._closing:
+            QTimer.singleShot(0, self._render_library)
+
     def _render_library(self, *_):
-        if not hasattr(self, "grid"):
+        if not hasattr(self, "grid") or self._closing:
             return
-        while self.grid.count():
-            item = self.grid.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        if self._library_drag_active:
+            self._library_render_pending = True
+            return
+        self._library_render_pending = False
+        self.cards.clear()
         query = self.search.text().strip().lower()
         kind = {1: "album", 2: "single"}.get(self.tabs.currentIndex())
+        album_song_ids = {track.song_id or track.id for entry in self.entries if entry.kind == "album"
+                          for track in entry.tracks}
+        album_sources = {(track.bvid, track.page) for entry in self.entries if entry.kind == "album"
+                         for track in entry.tracks}
         entries = [e for e in self.entries if (not kind or e.kind == kind)
+                   and (kind is not None or e.kind == "album" or
+                        (e.id not in album_song_ids and (e.bvid, e.page) not in album_sources))
                    and (query in e.title.lower() or query in e.bvid.lower())]
         self.library_count.setText(self.tr("{total} 项收藏 · 当前显示 {shown} 项", total=len(self.entries), shown=len(entries)))
         if not entries:
@@ -707,44 +904,44 @@ class MainWindow(QMainWindow):
             hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
             hint.setWordWrap(True)
             layout.addWidget(hint)
-            self.grid.addWidget(empty, 0, 0, 1, 2)
+            self.cards.show_empty(empty)
             return
-        for index, entry in enumerate(entries):
-            card = QFrame()
-            card.setObjectName("card")
-            card.setMinimumWidth(235)
-            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            layout = QVBoxLayout(card)
-            layout.setContentsMargins(14, 14, 14, 14)
-            layout.setSpacing(9)
-            art = CoverButton(self.tr("专辑" if entry.kind == "album" else "单曲"), self.theme)
+        cards = []
+        for entry in entries:
+            card = LibraryCard(entry.id, self._library_drag_group, self.tr("拖动到另一张卡片以交换位置"))
+            card.swapRequested.connect(self.swap_library_entries)
+            card.dragActiveChanged.connect(self._card_drag_state)
+            card.setAccessibleName(entry.title)
+            card.openRequested.connect(lambda _id, e=entry: self.open_entry(e))
+            card.playRequested.connect(lambda _id, e=entry: self.resolve_entry(e, True))
+            card.menuRequested.connect(lambda _id, pos, e=entry: self._entry_menu(e, pos))
+            art = CardArtwork(self.theme)
             art.setAccessibleName(entry.title)
-            art.setToolTip(self.tr("打开专辑" if entry.kind == "album" else "点击播放"))
-            art.clicked.connect(lambda _checked=False, e=entry: self.open_album(e) if e.kind == "album" else self.resolve_entry(e, True))
-            layout.addWidget(art)
-            if entry.cover:
-                self._load_cover(entry.cover, art)
-            title = label(entry.title, "section")
-            title.setWordWrap(True)
-            layout.addWidget(title)
-            layout.addWidget(label(entry.bvid or self.tr("自建专辑"), "muted"))
+            art.setToolTip(self.tr("打开专辑" if entry.kind == "album" else "打开单曲详情"))
             if entry.kind == "album":
                 subtitle = self.tr("专辑 · {count} 首", count=len(entry.tracks)) if entry.resolved else self.tr("专辑 · 等待导入")
             else:
-                subtitle = self.tr("单曲 · P{page}", page=entry.page)
-            layout.addWidget(label(subtitle, "muted"))
-            actions = QHBoxLayout()
-            actions.addWidget(button(self.tr("播放"), lambda _checked=False, e=entry: self.resolve_entry(e, True), True))
-            actions.addWidget(button(self.tr("＋ 队列"), lambda _checked=False, e=entry: self.resolve_entry(e, False)))
-            more = button("···", lambda _checked=False, e=entry: self._entry_menu(e))
-            more.setToolTip(self.tr("编辑 / 删除 / 在 B站打开"))
-            actions.addWidget(more)
-            layout.addLayout(actions)
-            self.grid.addWidget(card, index // 2, index % 2)
-        for column in range(2):
-            self.grid.setColumnStretch(column, 1)
+                subtitle = entry.tracks[0].artist if entry.tracks and entry.tracks[0].artist else self.tr("单曲 · P{page}", page=entry.page)
+            card.set_content(art, entry.title, subtitle, self.tr("播放"))
+            card.subtitle_label.setToolTip(subtitle + ("\n" + entry.bvid if entry.bvid else ""))
+            if entry.cover:
+                self._load_cover(entry.cover, art)
+            cards.append(card)
+        self.cards.show_cards(cards)
 
-    def _load_cover(self, source: str, artwork: CoverButton):
+    def swap_library_entries(self, source_id: str, target_id: str):
+        if source_id == target_id:
+            return
+        indexes = {entry.id: index for index, entry in enumerate(self.entries)}
+        if source_id not in indexes or target_id not in indexes:
+            return
+        source, target = indexes[source_id], indexes[target_id]
+        self.entries[source], self.entries[target] = self.entries[target], self.entries[source]
+        self._render_library()
+        self._save()
+
+    def _load_cover(self, source: str, artwork):
+        artwork._requested_cover = source
         if source in self._cover_pixmaps:
             artwork.set_pixmap(self._cover_pixmaps[source])
             return
@@ -761,16 +958,92 @@ class MainWindow(QMainWindow):
             self._cover_pixmaps[source] = pixmap
             for ref in self._cover_waiters.pop(source, []):
                 target = ref()
-                if target is not None and not sip.isdeleted(target):
+                if target is not None and not sip.isdeleted(target) and getattr(target, "_requested_cover", None) == source:
                     target.set_pixmap(pixmap)
 
         def failed(_message):
             for ref in self._cover_waiters.pop(source, []):
                 target = ref()
-                if target is not None and not sip.isdeleted(target):
+                if target is not None and not sip.isdeleted(target) and getattr(target, "_requested_cover", None) == source:
                     target.setToolTip(self.tr("封面暂时无法加载"))
 
         self._submit(lambda: self.covers.fetch(source), done, failed)
+
+    def show_json_menu(self):
+        menu = QMenu(self)
+        menu.addAction(self.tr("导入 JSON 曲目…"), self.import_json)
+        menu.addAction(self.tr("导出全部曲目 JSON…"), self.export_json)
+        menu.exec(self.json_button.mapToGlobal(self.json_button.rect().bottomLeft()))
+        menu.deleteLater()
+
+    def export_json(self):
+        filename, _ = QFileDialog.getSaveFileName(
+            self, self.tr("导出全部曲目"), "bili-music-library.json", self.tr("JSON 文件 (*.json)"),
+        )
+        if filename:
+            self.export_json_path(Path(filename))
+
+    def export_json_path(self, path: Path):
+        if path.resolve() == self.store.path.resolve():
+            self._error(self.tr("请选择其他路径，不能覆盖播放器正在使用的音乐库。"))
+            return False
+        try:
+            write_library(path, self.entries)
+        except (ValueError, OSError) as exc:
+            self._error(self.tr("导出失败：{message}", message=str(exc)))
+            return False
+        self._status("已导出全部 {count} 项音乐库内容", count=len(self.entries))
+        return True
+
+    def import_json(self):
+        filename, _ = QFileDialog.getOpenFileName(
+            self, self.tr("导入 JSON 曲目"), "", self.tr("JSON 文件 (*.json)"),
+        )
+        if filename:
+            self.import_json_path(Path(filename))
+
+    def import_json_path(self, path: Path):
+        try:
+            entries = read_library(path)
+        except (ValueError, OSError) as exc:
+            self._error(self.tr("导入失败：{message}", message=str(exc)))
+            return False
+        if not entries:
+            self._status("JSON 中没有可导入的曲目")
+            return True
+        original = self.entries
+        from copy import deepcopy
+        combined = deepcopy(original)
+        merge_libraries(combined, entries)
+        self.entries = combined
+        if not self._save():
+            self.entries = original
+            return False
+        self._render_library()
+        self._status("已从 JSON 导入 {count} 项，已有曲目保留", count=len(entries))
+        return True
+
+    def import_list(self):
+        dialog = ListImportDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.import_result is not None:
+            self.commit_list_import(dialog.import_result)
+
+    def commit_list_import(self, result):
+        album = replace(result.album, tracks=list(result.album.tracks))
+        self.entries.append(album)
+        self._normalize_library()
+        self._render_library()
+        if not self._save():
+            return
+        self._status("已导入列表专辑 {title} · {count} 首 · 跳过 {skipped} 个视频",
+                     title=album.title, count=len(album.tracks), skipped=len(result.skipped))
+        if result.skipped:
+            message = QMessageBox(self)
+            message.setWindowTitle(self.tr("列表导入完成"))
+            message.setIcon(QMessageBox.Icon.Information)
+            message.setText(self.tr("专辑已保存，跳过 {count} 个不可用视频。", count=len(result.skipped)))
+            message.setDetailedText("\n".join(translate_error(reason, self.language) for reason in result.skipped))
+            message.exec()
 
     def add_entry(self):
         dialog = EntryDialog(self)
@@ -784,10 +1057,14 @@ class MainWindow(QMainWindow):
             custom_title = entry.title and entry.title != entry.bvid
             title = entry.title if custom_title else (info.title if entry.kind == "album" else info.tracks[0].title)
             tracks = copy_tracks(info.tracks)
-            if entry.kind == "single" and custom_title:
-                tracks[0].title = entry.title
+            if entry.kind == "single":
+                if custom_title:
+                    tracks[0].title = entry.title
+                tracks[0].artist = entry.artist
+                tracks[0].date = entry.date
             imported = replace(entry, title=title, cover=info.cover, tracks=tracks, resolved=True)
             self.entries.append(imported)
+            self._normalize_library()
             self._render_library()
             self._save()
             self._status("已导入 {title}", title=imported.title)
@@ -809,8 +1086,22 @@ class MainWindow(QMainWindow):
         self._status("已创建空专辑")
         return album
 
+    def _normalize_library(self):
+        normalize_library(self.entries)
+
+    def song_for_track(self, track: Track, album=None):
+        song = find_song(self.entries, track.song_id or track.id)
+        if song is None:
+            self._normalize_library()
+            song = find_song(self.entries, track.song_id or track.id)
+        if song is None:
+            song = next((e for e in self.entries if e.kind == "single" and
+                         (e.bvid, e.page) == (track.bvid, track.page)), None)
+        return song
+
     def _find(self, identity: str):
-        return next((entry for entry in self.entries if entry.id == identity), None)
+        direct = next((entry for entry in self.entries if entry.id == identity), None)
+        return direct or find_song(self.entries, identity)
 
     def _ensure_entry(self, entry: LibraryEntry, done, failed=None):
         if entry.resolved:
@@ -830,19 +1121,52 @@ class MainWindow(QMainWindow):
                 return
             if not current.resolved:
                 tracks = copy_tracks(info.tracks)
-                if current.kind == "single" and current.title and current.title != current.bvid:
-                    tracks[0].title = current.title
+                if current.kind == "single":
+                    if current.title and current.title != current.bvid:
+                        tracks[0].title = current.title
+                    tracks[0].artist = current.artist
+                    tracks[0].date = current.date
                 current.tracks = tracks
                 current.cover = current.cover or info.cover
                 current.resolved = True
                 if not current.title or current.title == current.bvid:
                     current.title = info.title if current.kind == "album" else tracks[0].title
                 if was_present:
+                    self._normalize_library()
+                    current = self._find(current.id) or current
                     self._save()
                     self._render_library()
             done(current)
 
         self._submit(lambda: BilibiliClient().get_video(entry), loaded, failed)
+
+    def open_entry(self, entry: LibraryEntry):
+        if entry is None:
+            return
+
+        def opened(current):
+            dialog = EntryDetailsDialog(self, current)
+            try:
+                dialog.exec()
+            finally:
+                if not sip.isdeleted(dialog):
+                    dialog.deleteLater()
+
+        self._ensure_entry(entry, opened)
+
+    def open_track_details(self, track: Track, album: LibraryEntry):
+        song = self.song_for_track(track, album)
+        if song is not None:
+            self.open_entry(song)
+
+    def edit_album_track(self, album_id: str, track_id: str):
+        album = self._find(album_id)
+        if album is None or album.kind != "album":
+            return
+        track = next((t for t in album.tracks if t.id == track_id or t.song_id == track_id), None)
+        song = self.song_for_track(track, album) if track is not None else None
+        if song is not None:
+            self.edit_single(song)
 
     def open_album(self, entry: LibraryEntry):
         def opened(album):
@@ -864,7 +1188,8 @@ class MainWindow(QMainWindow):
         if target is None:
             return
         for tracks, cover, title in pending:
-            target.tracks.extend(tracks)
+            known = {t.id for t in target.tracks}
+            target.tracks.extend(t for t in tracks if t.id not in known)
             target.cover = target.cover or cover
             self._status("已将 {title} 加入 {album}", title=title, album=target.title)
         if pending:
@@ -880,7 +1205,15 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError) as exc:
                 self._error(str(exc))
                 return
-        self.entries = [album if e.id == album.id else e for e in self.entries]
+        current = self._find(album.id)
+        members = []
+        for track in album.tracks:
+            song = self.song_for_track(track, album)
+            members.append(song.tracks[0] if song and song.tracks else track)
+        current.title, current.cover = album.title, album.cover
+        current.tracks = members
+        current.resolved = True
+        self._normalize_library()
         self._render_library()
         self._save()
         self._status("专辑已保存")
@@ -894,13 +1227,15 @@ class MainWindow(QMainWindow):
             def target_ready(target):
                 if self._find(target.id) is not target:
                     return
-                tracks = copy_tracks(source.tracks)
+                tracks = list(source.tracks)
                 if target.id in self._editing_albums:
                     self._deferred_album_additions.setdefault(target.id, []).append((tracks, source.cover, source.title))
                     return
-                target.tracks.extend(tracks)
+                known = {t.id for t in target.tracks}
+                target.tracks.extend(t for t in tracks if t.id not in known)
                 if not target.cover:
                     target.cover = source.cover
+                self._normalize_library()
                 self._save()
                 self._render_library()
                 self._status("已将 {title} 加入 {album}", title=source.title, album=target.title)
@@ -918,42 +1253,121 @@ class MainWindow(QMainWindow):
         if accepted:
             self.add_single_to_album(entry, albums[choices.index(chosen)])
 
-    def _entry_menu(self, entry):
-        menu = QMenu(self)
-        edit = menu.addAction(self.tr("编辑专辑" if entry.kind == "album" else "编辑"))
-        add_to_album = menu.addAction(self.tr("加入专辑…")) if entry.kind == "single" else None
-        open_web = menu.addAction(self.tr("在 B站打开"))
-        open_web.setEnabled(bool(entry.bvid))
-        menu.addSeparator()
-        remove = menu.addAction(self.tr("从音乐库删除"))
-        chosen = menu.exec(self.cursor().pos())
-        if chosen is None:
+    def _commit_song_edit(self, current, updated):
+        song = self._find(current.id)
+        if song is None or song.kind != "single":
             return
-        if chosen == edit:
-            if entry.kind == "album":
-                self.open_album(entry)
+        collision = next((e for e in self.entries if e.kind == "single" and e.id != song.id and
+                          (e.bvid, e.page) == (updated.bvid, updated.page)), None)
+        if collision is not None:
+            self._error(self.tr("该视频分 P 已有单曲，请直接编辑已有歌曲。"))
+            return
+        canonical = song.tracks[0] if song.tracks else None
+        if updated.tracks:
+            candidate = updated.tracks[0]
+            if canonical is None:
+                canonical = replace(candidate, id=song.id, song_id=song.id)
             else:
-                dialog = EntryDialog(self, entry)
-                if dialog.exec() == QDialog.DialogCode.Accepted:
-                    updated = dialog.value()
-                    if updated.kind == "album":
-                        updated.resolved = False
-                        updated.tracks = []
-                    if (updated.bvid, updated.page) == (entry.bvid, entry.page) and updated.kind == entry.kind:
-                        updated.tracks = copy_tracks(updated.tracks)
-                        if updated.tracks:
-                            updated.tracks[0].title = updated.title
-                    self.entries = [updated if e.id == entry.id else e for e in self.entries]
-                    self._render_library()
-                    self._save()
-        elif add_to_album is not None and chosen == add_to_album:
-            self._choose_album(entry)
-        elif chosen == open_web:
-            QDesktopServices.openUrl(QUrl(f"https://www.bilibili.com/video/{entry.bvid}/"))
-        elif chosen == remove:
+                canonical.bvid, canonical.cid, canonical.page = candidate.bvid, candidate.cid, candidate.page
+                canonical.duration = candidate.duration
+            canonical.title, canonical.artist, canonical.date = updated.title, updated.artist, updated.date
+            canonical.id = canonical.song_id = song.id
+            song.tracks = [canonical]
+        song.title, song.bvid, song.page = updated.title, updated.bvid, updated.page
+        song.artist, song.date, song.cover = updated.artist, updated.date, updated.cover
+        song.resolved = updated.resolved
+        self._normalize_library()
+        self._sync_song_queue(song)
+        self._render_library()
+        self._save()
+        self.libraryChanged.emit()
+
+    def _sync_song_queue(self, song):
+        if not song.tracks:
+            return
+        canonical = song.tracks[0]
+        for index in range(self.queue.count()):
+            item = self.queue.item(index)
+            queued = item.data(Qt.ItemDataRole.UserRole)
+            if queued.song_id == song.id:
+                queued = replace(canonical, id=queued.id, song_id=song.id)
+                item.setData(Qt.ItemDataRole.UserRole, queued)
+                item.setText(f"{queued.title}\nP{queued.page} · {queued.artist or queued.bvid}")
+                item.setToolTip(f"{queued.title}\n{queued.bvid} · P{queued.page}")
+                if queued.id == self.current_id:
+                    self.now_title.setText(song.title)
+                    self.now_meta.setText(f"{song.artist or song.bvid} · P{song.page}")
+                    self._sync_mini_text()
+                    self._update_current_cover(queued)
+
+    def edit_single(self, entry: LibraryEntry):
+        self._normalize_library()
+        current = self._find(entry.id)
+        if current is None or current.kind != "single":
+            return
+        dialog = EntryDialog(self, current)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        updated = dialog.value()
+        revision = self._song_edit_requests.get(current.id, 0) + 1
+        self._song_edit_requests[current.id] = revision
+        updated.kind = "single"
+        if (updated.bvid, updated.page) != (current.bvid, current.page):
+            conflict = next((song for song in self.entries if song.kind == "single" and song.id != current.id
+                             and (song.bvid, song.page) == (updated.bvid, updated.page)), None)
+            if conflict is not None:
+                self._error(self.tr("该视频分 P 已有单曲，请直接编辑已有歌曲。"))
+                return
+            # Validate the replacement before changing the shared song entity.
+            def loaded(info):
+                if self._song_edit_requests.get(current.id) != revision:
+                    return
+                updated.tracks = info.tracks
+                updated.cover = info.cover
+                updated.resolved = True
+                self._commit_song_edit(current, updated)
+            self._submit(lambda: BilibiliClient().get_video(updated), loaded)
+        else:
+            updated.tracks = list(current.tracks)
+            self._commit_song_edit(current, updated)
+
+    def delete_entry(self, entry: LibraryEntry):
+        if entry.kind == "single":
+            delete_song(self.entries, entry.id)
+        else:
             self.entries = [e for e in self.entries if e.id != entry.id]
-            self._render_library()
-            self._save()
+        self._render_library()
+        self._save()
+        self.libraryChanged.emit()
+
+    def _build_entry_menu(self, entry):
+        menu = QMenu(self)
+
+        def action(key, text, callback):
+            item = menu.addAction(self.tr(text))
+            item.setData(key)
+            item.triggered.connect(callback)
+            return item
+
+        action("play", "播放", lambda: self.resolve_entry(entry, True))
+        action("queue", "加入播放列表", lambda: self.resolve_entry(entry, False))
+        menu.addSeparator()
+        action("details", "打开专辑" if entry.kind == "album" else "打开单曲详情", lambda: self.open_entry(entry))
+        action("edit", "编辑专辑" if entry.kind == "album" else "编辑", lambda: self.open_album(entry) if entry.kind == "album" else self.edit_single(entry))
+        if entry.kind == "single":
+            action("add_album", "加入专辑…", lambda: self._choose_album(entry))
+        web = action("source", "在 B站打开", lambda: QDesktopServices.openUrl(QUrl(f"https://www.bilibili.com/video/{entry.bvid}/")))
+        web.setEnabled(bool(entry.bvid))
+        menu.addSeparator()
+        action("delete", "从音乐库删除", lambda: self.delete_entry(entry))
+        return menu
+
+    def _entry_menu(self, entry, position=None):
+        menu = self._build_entry_menu(entry)
+        try:
+            menu.exec(position if position is not None else self.cursor().pos())
+        finally:
+            menu.deleteLater()
 
     def _submit(self, fn, done, error=None):
         task = Task(fn)
@@ -996,6 +1410,17 @@ class MainWindow(QMainWindow):
             self.queue.addItem(item)
         self._queue_changed(persist=persist)
 
+    def insert_track_next(self, track: Track) -> QListWidgetItem:
+        queued = replace(track, id=str(uuid4()), song_id=track.song_id or track.id)
+        item = QListWidgetItem(f"{queued.title}\nP{queued.page} · {queued.artist or queued.bvid}")
+        item.setData(Qt.ItemDataRole.UserRole, queued)
+        item.setToolTip(f"{queued.title}\n{queued.bvid} · P{queued.page}")
+        row = self._current_row()
+        self.queue.insertItem(row + 1 if row >= 0 else self.queue.count(), item)
+        self._play_next_priority.insert(0, queued.id)
+        self._queue_changed()
+        return item
+
     def _tracks(self) -> list[Track]:
         return [self.queue.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.queue.count())]
 
@@ -1021,6 +1446,8 @@ class MainWindow(QMainWindow):
         self.player.stop()
         self.player.setSource(QUrl())
         self.current_id = track.id
+        self._play_next_priority = [identity for identity in self._play_next_priority if identity != track.id]
+        self.shuffle_order.record(track.id)
         self.queue.setCurrentItem(item)
         self.now_title.setText(track.title)
         self.now_meta.setText(f"{track.artist or track.bvid} · P{track.page}")
@@ -1117,14 +1544,31 @@ class MainWindow(QMainWindow):
         else:
             self.play_item(self.queue.currentItem() or self.queue.item(0))
 
+    def _queue_item_for_id(self, identity):
+        return next((self.queue.item(i) for i in range(self.queue.count())
+                     if self.queue.item(i).data(Qt.ItemDataRole.UserRole).id == identity), None)
+
     def previous(self):
-        self.play_item(self.queue.item(max(0, self._current_row() - 1)))
+        if self.mode.currentIndex() == 3:
+            identity = self.shuffle_order.previous([t.id for t in self._tracks()], self.current_id)
+            self.play_item(self._queue_item_for_id(identity))
+        else:
+            self.play_item(self.queue.item(max(0, self._current_row() - 1)))
 
     def next(self, _checked=False, automatic=False):
         count = self.queue.count()
         if not count:
             return
         row = self._current_row()
+        if self.mode.currentIndex() == 3:
+            while self._play_next_priority:
+                item = self._queue_item_for_id(self._play_next_priority.pop(0))
+                if item is not None:
+                    self.play_item(item)
+                    return
+            identity = self.shuffle_order.next([t.id for t in self._tracks()], self.current_id)
+            self.play_item(self._queue_item_for_id(identity))
+            return
         if automatic and self.mode.currentIndex() == 2 and row >= 0:
             self.play_item(self.queue.item(row))
             return
@@ -1138,6 +1582,8 @@ class MainWindow(QMainWindow):
         self.play_item(self.queue.item(next_row))
 
     def clear_queue(self):
+        self._play_next_priority.clear()
+        self.shuffle_order.reset()
         self._reset_playback_recovery()
         self._request += 1
         self._library_request += 1
@@ -1181,6 +1627,15 @@ class MainWindow(QMainWindow):
                     self._sync_mini_text()
                     self._update_current_cover()
             self._queue_changed()
+
+    def _seek_to(self, position: int):
+        position = max(0, min(position, self.seek.maximum()))
+        if self._resume_position is not None:
+            self._resume_position = position
+        self._last_played_position = position
+        self._last_progress_at = time.monotonic()
+        self.player.setPosition(position)
+        self._position(position)
 
     def _position(self, position):
         if not self._loading_stream and self._resume_position is None and position > 0:
@@ -1233,13 +1688,17 @@ class MainWindow(QMainWindow):
 
     def _save(self):
         try:
+            self._normalize_library()
             self.store.save(self.entries, self._tracks(), self.volume.value(),
-                            {"theme": self.theme, "language": self.language})
+                            {"theme": self.theme, "language": self.language, "card_scale": self.card_scale,
+                             "play_mode": self.mode.currentIndex()})
+            return True
         except (ValueError, OSError) as exc:
             self._status("保存失败：{message}", message=translate_error(str(exc), self.language))
             if not self._save_error_shown:
                 self._save_error_shown = True
                 self._error(self.tr("无法保存音乐库：{message}", message=str(exc)))
+            return False
 
     def _error(self, message: str):
         message = translate_error(message, self.language)
@@ -1255,6 +1714,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._closing = True
+        self._frameless_controller.dispose()
+        self._set_mini_queue_open(False)
         self.playback_watchdog.stop()
         self._reset_playback_recovery()
         self.tray.hide()

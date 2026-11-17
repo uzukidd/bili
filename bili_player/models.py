@@ -55,11 +55,15 @@ class Track:
     artist: str = ""
     duration: int = 0
     id: str = field(default_factory=lambda: str(uuid4()))
+    date: str = ""
+    song_id: str = ""
 
     def __post_init__(self) -> None:
         _text(self.title, "标题")
         _text(self.id, "曲目 ID", nonempty=True)
+        _text(self.song_id, "歌曲 ID")
         _text(self.artist, "作者")
+        _text(self.date, "日期")
         self.bvid = normalize_bvid(self.bvid)
         _integer(self.cid, 1, "CID")
         _integer(self.page, 1, "分 P 序号")
@@ -76,10 +80,14 @@ class LibraryEntry:
     tracks: list[Track] = field(default_factory=list)
     cover: str = ""
     resolved: bool = False
+    artist: str = ""
+    date: str = ""
 
     def __post_init__(self) -> None:
         _text(self.title, "标题")
         _text(self.id, "条目 ID", nonempty=True)
+        _text(self.artist, "作者")
+        _text(self.date, "日期")
         if self.kind not in ("single", "album"):
             raise ValueError("条目类型必须是 single 或 album")
         if self.kind != "album" or self.bvid != "":
@@ -109,6 +117,14 @@ class Store:
             raise ValueError("主题必须是 light 或 dark")
         if result["language"] not in ("zh_CN", "en_US"):
             raise ValueError("语言必须是 zh_CN 或 en_US")
+        if "card_scale" in result:
+            value = result["card_scale"]
+            if type(value) not in (int, float) or not 0.7 <= value <= 1.6:
+                raise ValueError("卡片缩放必须在 70% 到 160% 之间")
+        if "play_mode" in result:
+            value = result["play_mode"]
+            if type(value) is not int or not 0 <= value <= 3:
+                raise ValueError("播放模式必须是 0 到 3 之间的整数")
         return result
 
     @staticmethod
@@ -123,24 +139,38 @@ class Store:
         return LibraryEntry(**fields)
 
     def _read(self) -> tuple[list[LibraryEntry], list[Track], int, dict, int, bytes]:
+        from .catalog import decode_library
+
         try:
             original = self.path.read_bytes()
         except FileNotFoundError:
-            return [], [], DEFAULT_VOLUME, dict(_DEFAULT_SETTINGS), 2, b""
+            return [], [], DEFAULT_VOLUME, dict(_DEFAULT_SETTINGS), 3, b""
         try:
             data = json.loads(original.decode("utf-8"))
-            if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2):
+            if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2, 3):
                 raise ValueError("不支持的音乐库格式")
             if not isinstance(data.get("entries"), list) or not isinstance(data.get("tracks"), list):
                 raise ValueError("音乐库列表格式不正确")
             volume = data["volume"]
             self._validate_volume(volume)
-            entries = [self._entry_from_dict(item) for item in data["entries"]]
+            entries = decode_library(data)
+            if any(not isinstance(item, dict) for item in data["tracks"]):
+                raise ValueError("播放队列必须是对象列表")
             tracks = [Track(**item) for item in data["tracks"]]
-            settings = self._validate_settings(data.get("settings", {}) if data["version"] == 2 else {})
+            self._link_queue(entries, tracks)
+            settings = self._validate_settings(data.get("settings", {}) if data["version"] >= 2 else {})
             return entries, tracks, volume, settings, data["version"], original
         except (ValueError, TypeError, KeyError, UnicodeError) as exc:
             raise ValueError(f"音乐库文件损坏，原文件已保留：{exc}") from exc
+
+    @staticmethod
+    def _link_queue(entries: list[LibraryEntry], tracks: list[Track]) -> None:
+        songs = {(entry.bvid, entry.page): entry.id for entry in entries if entry.kind == "single"}
+        for track in tracks:
+            # Queue IDs identify occurrences, and must never be rewritten as song IDs.
+            source_id = songs.get((track.bvid, track.page))
+            if source_id is not None:
+                track.song_id = source_id
 
     def load(self) -> tuple[list[LibraryEntry], list[Track], int]:
         entries, tracks, volume, settings, _, _ = self._read()
@@ -151,6 +181,8 @@ class Store:
         self, entries: list[LibraryEntry], tracks: list[Track], volume: int,
         settings: dict | None = None,
     ) -> None:
+        from .catalog import encode_library
+
         self._validate_volume(volume)
         selected_settings = self._validate_settings(self.settings if settings is None else settings)
         # Validate the original before replacing it, even when load was never called.
@@ -164,13 +196,13 @@ class Store:
             entry.__post_init__()
         for track in tracks:
             Track(**asdict(track))
-        data = {
-            "version": 2,
-            "entries": [asdict(entry) for entry in entries],
+        data = encode_library(entries)
+        self._link_queue(entries, tracks)
+        data.update({
             "tracks": [asdict(track) for track in tracks],
             "volume": volume,
             "settings": selected_settings,
-        }
+        })
         payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary: str | None = None
@@ -185,6 +217,8 @@ class Store:
                 os.fsync(handle.fileno())
             if version == 1:
                 self._backup_v1(original)
+            elif version == 2:
+                self._backup_legacy(original, 2)
             os.replace(temporary, self.path)
             temporary = None
             self.settings = selected_settings
@@ -193,7 +227,10 @@ class Store:
                 Path(temporary).unlink(missing_ok=True)
 
     def _backup_v1(self, original: bytes) -> None:
-        backup = self.path.with_name(self.path.name + ".v1.bak")
+        self._backup_legacy(original, 1)
+
+    def _backup_legacy(self, original: bytes, version: int) -> None:
+        backup = self.path.with_name(self.path.name + f".v{version}.bak")
         try:
             handle = backup.open("xb")
         except FileExistsError:

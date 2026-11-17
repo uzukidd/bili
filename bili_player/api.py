@@ -83,8 +83,6 @@ class BilibiliClient:
             selected = [page for page in pages if isinstance(page, dict) and page.get("page") == entry.page]
             if not selected:
                 raise BilibiliError(f"视频不存在第 {entry.page} P")
-        owner = data.get("owner") or {}
-        artist = owner.get("name", "") if isinstance(owner, dict) else ""
         title = data.get("title") or entry.title or entry.bvid
         cover = data.get("pic") or ""
         if not isinstance(title, str) or not isinstance(cover, str):
@@ -97,11 +95,10 @@ class BilibiliClient:
                 if not isinstance(page, dict):
                     raise ValueError("分 P 信息不是对象")
                 tracks.append(Track(
-                    title=page.get("part") or title,
+                    title=title if len(pages) == 1 else page.get("part") or title,
                     bvid=entry.bvid,
                     cid=page["cid"],
                     page=page["page"],
-                    artist=artist,
                     duration=page.get("duration", 0),
                 ))
         except (KeyError, TypeError, ValueError) as exc:

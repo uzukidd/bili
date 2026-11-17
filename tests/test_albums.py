@@ -14,7 +14,7 @@ import unittest
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 
 from bili_player import dialogs
 from bili_player.api import VideoInfo
+from bili_player.details import EntryDetailsDialog
 from bili_player.models import LibraryEntry, Store, Track
 
 
@@ -49,6 +50,35 @@ class PendingParent(QWidget):
             error(str(exc))
         else:
             done(result)
+
+
+class CanonicalParent(PendingParent):
+    """A tiny shared-song parent; album rows refer to the same stored track."""
+
+    def __init__(self, entries):
+        super().__init__()
+        self.entries = entries
+        for entry in entries:
+            if entry.kind == "single":
+                for track in entry.tracks:
+                    track.song_id = entry.id
+        self.edit_single = Mock(side_effect=self._edit_single)
+        self.open_album = Mock()
+        self._load_cover = Mock()
+
+    def _find(self, identity):
+        return next((entry for entry in self.entries if entry.id == identity), None)
+
+    def song_for_track(self, track, album=None):
+        identity = getattr(track, "song_id", "") or track.id
+        return next((entry for entry in self.entries
+                     if entry.kind == "single" and entry.id == identity), None)
+
+    @staticmethod
+    def _edit_single(song):
+        song.title = song.tracks[0].title = "Shared edited song"
+        song.artist = song.tracks[0].artist = "Shared author"
+        song.date = song.tracks[0].date = "Shared date"
 
 
 class AlbumDialogTests(unittest.TestCase):
@@ -79,7 +109,10 @@ class AlbumDialogTests(unittest.TestCase):
 
     def tracks(self):
         return [
-            Track(f"Song {page}", BVID, page * 100, page, artist=f"Artist {page}", duration=page * 10)
+            Track(
+                f"Song {page}", BVID, page * 100, page, artist=f"Artist {page}",
+                duration=page * 10, date=f"手填日期 {page}",
+            )
             for page in (1, 2, 3)
         ]
 
@@ -150,7 +183,9 @@ class AlbumDialogTests(unittest.TestCase):
         self.select_rows(dialog, 2)
         dialog.move_selected(-2)
         self.select_rows(dialog, 1)
-        edited = replace(dialog._tracks()[1], title="Renamed song", artist="Custom artist")
+        edited = replace(
+            dialog._tracks()[1], title="Renamed song", artist="作曲者 あおい", date="任意日期",
+        )
         self.picker("TrackDialog", edited)
         dialog.edit_selected()
         self.assertEqual(self.parent.jobs, [])
@@ -161,8 +196,9 @@ class AlbumDialogTests(unittest.TestCase):
         self.assertEqual(committed.title, "Edited album")
         self.assertEqual(committed.cover, "https://example.com/custom.jpg")
         self.assertEqual([track.title for track in committed.tracks], ["Added song", "Renamed song", "Song 3"])
-        self.assertEqual(committed.tracks[1].artist, "Custom artist")
-        self.assertNotEqual(committed.tracks[0].id, added.id)
+        self.assertEqual(committed.tracks[1].artist, "作曲者 あおい")
+        self.assertEqual(committed.tracks[1].date, "任意日期")
+        self.assertEqual(committed.tracks[0].id, added.id)
         self.assertNotIn(original.tracks[1].id, [track.id for track in committed.tracks])
         self.assertEqual(original, before)
         with tempfile.TemporaryDirectory() as directory:
@@ -219,8 +255,8 @@ class AlbumDialogTests(unittest.TestCase):
         self.assertFalse(dialog.save_button.isEnabled())
         self.parent.complete(0)
         self.assertTrue(dialog.save_button.isEnabled())
-        self.assertEqual(len(dialog._tracks()), 2)
-        self.assertEqual(len({track.id for track in dialog._tracks()}), 2)
+        self.assertEqual(len(dialog._tracks()), 1)
+        self.assertEqual(len({track.id for track in dialog._tracks()}), 1)
 
     def test_import_appends_all_parts_and_preserves_custom_album_title_and_cover(self):
         original = self.album()
@@ -251,9 +287,9 @@ class AlbumDialogTests(unittest.TestCase):
         self.parent.complete(1)
         self.assertEqual(dialog.cover_input.text(), "https://example.com/user-chosen.jpg")
 
-    def test_cached_singles_copy_independent_ids_without_network(self):
-        cached = Track("Cached title", BVID, 101, 1, artist="Original artist")
-        single = LibraryEntry("Custom single title", BVID, tracks=[cached], resolved=True)
+    def test_cached_singles_keep_identity_and_deduplicate_without_network(self):
+        cached = Track("Cached title", BVID, 101, 1, artist="Original artist", date="任意日期")
+        single = LibraryEntry("Custom single title", BVID, id=cached.id, tracks=[cached], resolved=True)
         before = deepcopy(single)
         dialog = self.open_album(self.album(tracks=[]), [single])
         self.picker("_SinglesDialog", [single])
@@ -262,19 +298,47 @@ class AlbumDialogTests(unittest.TestCase):
         dialog.add_existing_singles()
         self.parent.complete(1)
         tracks = dialog._tracks()
-        self.assertEqual([track.title for track in tracks], ["Custom single title"] * 2)
-        self.assertEqual(len({cached.id, tracks[0].id, tracks[1].id}), 3)
+        self.assertEqual([track.title for track in tracks], ["Custom single title"])
+        self.assertEqual(tracks[0].id, single.id)
+        self.assertIsNot(tracks[0], cached)
         self.assertEqual(tracks[0].artist, "Original artist")
-        self.select_rows(dialog, 0)
-        dialog.remove_selected()
-        dialog._tracks()[0].artist = "Outside mutation"
+        self.assertEqual(tracks[0].date, "任意日期")
+        tracks[0].artist = "Outside mutation"
         self.assertEqual(single, before)
         self.assertEqual(dialog._tracks()[0].artist, "Original artist")
+        self.select_rows(dialog, 0)
+        dialog.remove_selected()
+        self.assertEqual(dialog._tracks(), [])
+        self.assertEqual(single, before)
+        self.client.get_tracks.assert_not_called()
+        self.client.get_video.assert_not_called()
+
+    def test_single_copy_uses_manual_entry_metadata_without_network(self):
+        cached = Track("Cached title", BVID, 101, 1, artist="Cached author", date="Cached date")
+        single = LibraryEntry(
+            "Custom single title", BVID, tracks=[cached], resolved=True,
+            artist="作曲者 あおい", date="任意日期",
+        )
+        before = deepcopy(single)
+        dialog = self.open_album(self.album(tracks=[]), [single])
+        self.picker("_SinglesDialog", [single])
+        dialog.add_existing_singles()
+        self.parent.complete(0)
+        copied = dialog._tracks()[0]
+        self.assertEqual(
+            (copied.title, copied.artist, copied.date),
+            (single.title, single.artist, single.date),
+        )
+        self.assertEqual(copied.id, cached.id)
+        self.assertEqual(single, before)
         self.client.get_tracks.assert_not_called()
         self.client.get_video.assert_not_called()
 
     def test_multiple_uncached_singles_resolve_sequentially_in_one_worker(self):
-        singles = [LibraryEntry(BVID, BVID), LibraryEntry("Custom second", OTHER_BVID, page=2)]
+        singles = [
+            LibraryEntry(BVID, BVID, artist="手填作者", date="任意日期"),
+            LibraryEntry("Custom second", OTHER_BVID, page=2),
+        ]
         responses = [[Track("API first", BVID, 100, 1)], [Track("API second", OTHER_BVID, 200, 2)]]
         self.client.get_tracks.side_effect = responses
         dialog = self.open_album(self.album(tracks=[]), singles)
@@ -285,24 +349,96 @@ class AlbumDialogTests(unittest.TestCase):
         self.parent.complete(0)
         self.assertEqual(self.client.get_tracks.call_args_list, [call(singles[0]), call(singles[1])])
         self.assertEqual([track.title for track in dialog._tracks()], ["API first", "Custom second"])
+        self.assertEqual((dialog._tracks()[0].artist, dialog._tracks()[0].date), ("手填作者", "任意日期"))
         self.assertEqual([entry.tracks for entry in singles], [[], []])
+
+    def test_canonical_row_edit_updates_both_albums_and_survives_cancel(self):
+        track, second, third = self.tracks()
+        song = LibraryEntry(track.title, track.bvid, id=track.id, tracks=[track], resolved=True)
+        album = self.album(tracks=[track, second, third])
+        other_album = self.album(title="Other folder", tracks=[track])
+        parent = CanonicalParent([song, album, other_album])
+        self.addCleanup(parent.deleteLater)
+        self.addCleanup(parent.close)
+        dialog = dialogs.AlbumDialog(parent, album, [song])
+        details = EntryDetailsDialog(parent, song)
+        self.open_dialogs.extend([dialog, details])
+        self.assertIsNot(dialog._tracks()[0], track)
+        self.assertIn("所有专辑", dialog.song_edit_hint.text())
+        self.select_rows(dialog, 0)
+        with patch("bili_player.dialogs.TrackDialog") as local_editor:
+            dialog.edit_selected()
+        local_editor.assert_not_called()
+        parent.edit_single.assert_called_once_with(song)
+        parent.open_album.assert_not_called()
+        details.refresh()
+        self.assertEqual(details.title_label.text(), "Shared edited song")
+        self.assertEqual(details.artist_label.text(), "作者：Shared author")
+        self.assertEqual(details.date_label.text(), "日期：Shared date")
+        self.assertEqual(dialog._tracks()[0], song.tracks[0])
+        self.assertIn("Shared edited song", dialog.tracks_list.item(0).text())
+        self.assertIs(album.tracks[0], song.tracks[0])
+        self.assertIs(other_album.tracks[0], song.tracks[0])
+        self.assertEqual(other_album.tracks[0].title, "Shared edited song")
+        dialog.title_input.setText("Discarded folder name")
+        self.select_rows(dialog, 0)
+        dialog.remove_selected()
+        self.select_rows(dialog, 1)
+        dialog.move_selected(-1)
+        dialog.reject()
+        self.assertEqual(album.title, "My album")
+        self.assertEqual([member.id for member in album.tracks], [track.id, second.id, third.id])
+        self.assertIs(parent._find(song.id), song)
+        self.assertEqual(song.title, "Shared edited song")
+        self.assertEqual(track.title, "Shared edited song")
+        self.assertEqual(parent.jobs, [])
+        self.client.get_tracks.assert_not_called()
+        self.client.get_video.assert_not_called()
+
+    def test_add_tracks_deduplicates_same_entity_or_source_and_remove_keeps_single(self):
+        track = self.tracks()[0]
+        song = LibraryEntry(track.title, track.bvid, id=track.id, tracks=[track], resolved=True)
+        album = self.album(tracks=[])
+        parent = CanonicalParent([song, album])
+        self.addCleanup(parent.deleteLater)
+        self.addCleanup(parent.close)
+        dialog = dialogs.AlbumDialog(parent, album, [song])
+        self.open_dialogs.append(dialog)
+        dialog.add_tracks([track, deepcopy(track), replace(track, id="same-source-alias")])
+        self.assertEqual([member.id for member in dialog._tracks()], [song.id])
+        self.assertIsNot(dialog._tracks()[0], track)
+        self.select_rows(dialog, 0)
+        dialog.remove_selected()
+        self.assertEqual(dialog.value().tracks, [])
+        self.assertIs(parent._find(song.id), song)
+        self.assertEqual(song.tracks, [track])
+        dialog.add_tracks([track])
+        self.assertEqual(dialog._tracks()[0].id, song.id)
+        self.assertEqual(album.tracks, [])
 
     def test_changed_source_refreshes_cid_and_keeps_user_metadata_and_identity(self):
         original = self.album()
         dialog = self.open_album(original)
         self.select_rows(dialog, 0)
         old = dialog._tracks()[0]
-        edited = replace(old, bvid=OTHER_BVID, page=2, title="Edited title", artist="Edited artist")
+        edited = replace(
+            old, bvid=OTHER_BVID, page=2, title="Edited title", artist="作曲者 あおい", date="任意日期",
+        )
         self.picker("TrackDialog", edited)
         self.client.get_tracks.side_effect = None
-        self.client.get_tracks.return_value = [Track("API title", OTHER_BVID, 9876, 2, artist="API artist", duration=88)]
+        self.client.get_tracks.return_value = [
+            Track("API title", OTHER_BVID, 9876, 2, artist="API uploader", duration=88, date="API date"),
+        ]
         dialog.edit_selected()
         self.assertFalse(dialog.save_button.isEnabled())
         self.assertEqual(dialog._tracks()[0].cid, old.cid)
         self.parent.complete(0)
         changed = dialog._tracks()[0]
         self.assertEqual((changed.bvid, changed.page, changed.cid, changed.duration), (OTHER_BVID, 2, 9876, 88))
-        self.assertEqual((changed.title, changed.artist, changed.id), ("Edited title", "Edited artist", old.id))
+        self.assertEqual(
+            (changed.title, changed.artist, changed.date, changed.id),
+            ("Edited title", "作曲者 あおい", "任意日期", old.id),
+        )
         request = self.client.get_tracks.call_args.args[0]
         self.assertEqual((request.kind, request.bvid, request.page), ("single", OTHER_BVID, 2))
         self.assertEqual(original.tracks[0], old)

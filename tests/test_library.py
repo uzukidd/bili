@@ -4,7 +4,7 @@ import copy
 import json
 import tempfile
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -62,7 +62,63 @@ class LibraryTests(unittest.TestCase):
                 self.store.save(entries, queue, volume)
                 self.assertEqual(self.store.load()[0][0], entry)
 
-    def test_v1_load_does_not_write_and_first_v2_save_backs_up_exact_bytes(self):
+    def test_manual_metadata_roundtrip_for_shared_songs_and_independent_queue(self):
+        track = Track("手填曲名", BVID, 101, 1, artist="歌曲作者", date="歌曲日期")
+        occurrence = replace(track, id="queue-occurrence")
+        single = LibraryEntry("手填单曲名", BVID, tracks=[track], resolved=True,
+                              artist="单曲作者", date="单曲日期")
+        album = LibraryEntry("手填专辑名", BVID, "album", tracks=[track], resolved=True,
+                             artist="专辑作者", date="专辑日期")
+        self.store.save([single, album], [occurrence], 60)
+        entries, queue, volume = self.store.load()
+        self.assertEqual((entries, queue, volume), ([single, album], [occurrence], 60))
+        self.assertIs(entries[0].tracks[0], entries[1].tracks[0])
+        self.assertIsNot(entries[0].tracks[0], queue[0])
+        self.assertEqual((queue[0].id, queue[0].song_id), ("queue-occurrence", single.id))
+        self.assertEqual((entries[0].tracks[0].artist, entries[0].tracks[0].date),
+                         ("单曲作者", "单曲日期"))
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(data["version"], 3)
+        expected_album = asdict(album)
+        expected_album.pop("tracks")
+        expected_album["song_ids"] = [single.id]
+        self.assertEqual(data["entries"], [asdict(single), expected_album])
+        self.assertEqual(data["tracks"], [asdict(occurrence)])
+        entries[0].artist = "只改单曲"
+        entries[0].tracks[0].artist = "编辑共享歌曲作者"
+        entries[0].tracks[0].date = "编辑共享歌曲日期"
+        self.assertEqual((entries[1].tracks[0].artist, queue[0].artist),
+                         ("编辑共享歌曲作者", "歌曲作者"))
+        self.assertEqual((entries[1].tracks[0].date, queue[0].date),
+                         ("编辑共享歌曲日期", "歌曲日期"))
+        self.store.save(entries, queue, volume)
+        reloaded, reloaded_queue, _ = self.store.load()
+        self.assertEqual((reloaded[0].artist, reloaded[1].tracks[0].artist), ("只改单曲", "只改单曲"))
+        self.assertEqual(reloaded[1].tracks[0].date, "编辑共享歌曲日期")
+        self.assertEqual(reloaded_queue, queue)
+
+    def test_v1_and_v2_missing_manual_fields_load_blank_without_rewriting_saved_data(self):
+        old_track = asdict(Track("保存的曲名", BVID, 101, 1, artist="保存的手填作者"))
+        old_track.pop("date")
+        old_entry = asdict(LibraryEntry("保存的条目名", BVID, "album", resolved=True))
+        old_entry.pop("artist")
+        old_entry.pop("date")
+        old_entry["tracks"] = [old_track]
+        for version in (1, 2):
+            with self.subTest(version=version):
+                original = self.write_data(version=version, entries=[old_entry], tracks=[old_track])
+                with patch("requests.sessions.Session.request", side_effect=AssertionError("unexpected network")):
+                    entries, queue, volume = self.store.load()
+                    self.assertEqual(self.path.read_bytes(), original)
+                    self.assertEqual((entries[0].title, entries[0].artist, entries[0].date),
+                                     ("保存的条目名", "", ""))
+                    for track in (entries[0].tracks[0], queue[0]):
+                        self.assertEqual((track.title, track.artist, track.date),
+                                         ("保存的曲名", "保存的手填作者", ""))
+                    self.store.save(entries, queue, volume)
+                    self.assertEqual(self.store.load(), (entries, queue, volume))
+
+    def test_v1_load_does_not_write_and_first_v3_save_backs_up_exact_bytes(self):
         original = self.legacy_bytes()
         self.path.write_bytes(original)
         entries, queue, volume = self.store.load()
@@ -77,7 +133,7 @@ class LibraryTests(unittest.TestCase):
         self.store.save(entries, queue, volume, {"theme": "dark", "language": "en_US"})
         self.assertEqual(backup.read_bytes(), original)
         data = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(data["version"], 2)
+        self.assertEqual(data["version"], 3)
         self.assertFalse(data["entries"][0]["resolved"])
         self.store.save([], [], 50)
         self.assertEqual(backup.read_bytes(), original)
@@ -143,27 +199,89 @@ class LibraryTests(unittest.TestCase):
                     Store(self.path).save([], [], 40)
                 self.assertEqual(self.path.read_bytes(), original)
 
-    def test_edited_mixed_source_tracks_roundtrip_and_do_not_alias_queue(self):
+    def test_card_scale_roundtrip_defaults_and_invalid_values(self):
+        self.store.save([], [], 40, {"card_scale": 1.3})
+        reloaded = Store(self.path)
+        reloaded.load()
+        self.assertEqual(reloaded.settings["card_scale"], 1.3)
+        original = self.path.read_bytes()
+        for value in (False, "1.2", 0.69, 1.61, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                reloaded.save([], [], 40, {"card_scale": value})
+            self.assertEqual(self.path.read_bytes(), original)
+        self.write_data(settings={"theme": "dark"})
+        reloaded.load()
+        self.assertEqual(reloaded.settings.get("card_scale", 1.0), 1.0)
+
+    def test_play_mode_roundtrip_is_optional_and_preserves_omitted_save_setting(self):
+        self.store.save([], [], 40)
+        self.store.load()
+        self.assertNotIn("play_mode", self.store.settings)
+        for mode in range(4):
+            with self.subTest(mode=mode):
+                self.store.save([], [], 40, {"play_mode": mode})
+                fresh = Store(self.path)
+                fresh.load()
+                self.assertEqual(fresh.settings["play_mode"], mode)
+                fresh.save([], [], 30)
+                reloaded = Store(self.path)
+                reloaded.load()
+                self.assertEqual(reloaded.settings["play_mode"], mode)
+
+    def test_invalid_play_mode_cannot_replace_valid_store_or_overwrite_corrupt_store(self):
+        invalid_modes = (-1, 4, True, False, 1.0, "1", None, [], {})
+        self.store.save([], [], 40, {"play_mode": 2})
+        original = self.path.read_bytes()
+        for mode in invalid_modes:
+            with self.subTest(action="save", mode=mode):
+                with self.assertRaises(ValueError):
+                    self.store.save([], [], 40, {"play_mode": mode})
+                self.assertEqual(self.path.read_bytes(), original)
+        for version in (2, 3):
+            for mode in invalid_modes:
+                with self.subTest(action="load", version=version, mode=mode):
+                    original = self.write_data(version=version, settings={"play_mode": mode})
+                    with self.assertRaisesRegex(ValueError, "原文件已保留"):
+                        Store(self.path).load()
+                    with self.assertRaises(ValueError):
+                        Store(self.path).save([], [], 40)
+                    self.assertEqual(self.path.read_bytes(), original)
+
+    def test_edited_mixed_source_tracks_share_singles_but_do_not_alias_queue(self):
         first = Track("重命名", OTHER_BVID, 202, 2, "编辑作者", 31, "edited-track")
         second = Track("另一首", BVID, 101, 1)
+        occurrence = replace(first, id="queued-mixed-source")
         album = LibraryEntry("我的专辑", BVID, "album", tracks=[first, second],
                              cover="https://image.test/cover.jpg", resolved=True)
         single = LibraryEntry("缓存单曲", OTHER_BVID, tracks=[first], resolved=True)
-        self.store.save([album, single], [first], 60)
-        entries, queue, _ = self.store.load()
-        self.assertEqual(entries, [album, single])
-        self.assertEqual(queue, [first])
+        original_entries = [album, single]
+        self.store.save(original_entries, [occurrence], 60)
+        entries, queue, volume = self.store.load()
+        self.assertEqual(entries, original_entries)
+        self.assertEqual(len(entries), 3)
+        self.assertEqual(entries[:2], [album, single])
+        self.assertEqual((entries[2].kind, entries[2].bvid, entries[2].page), ("single", BVID, 1))
+        self.assertIs(entries[0].tracks[0], entries[1].tracks[0])
+        self.assertIs(entries[0].tracks[1], entries[2].tracks[0])
+        self.assertEqual(queue, [occurrence])
+        self.assertEqual((queue[0].id, queue[0].song_id), ("queued-mixed-source", single.id))
+        self.assertIsNot(queue[0], entries[1].tracks[0])
         data = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(data["entries"][0]["tracks"][0], asdict(first))
-        entries[0].tracks[0].title = "只改专辑"
+        self.assertEqual(data["entries"][0]["song_ids"], [single.id, entries[2].id])
+        self.assertNotIn("tracks", data["entries"][0])
+        entries[0].tracks[0].title = "编辑共享歌曲"
         self.assertEqual(queue[0].title, "重命名")
-        self.assertEqual(entries[1].tracks[0].title, "重命名")
-        album.tracks = [second]
-        self.store.save([album], queue, 60)
-        loaded = self.store.load()[0][0]
-        self.assertEqual(loaded.tracks, [second])
-        self.assertTrue(loaded.resolved)
-        self.assertEqual(loaded.cover, album.cover)
+        self.assertEqual(entries[1].tracks[0].title, "编辑共享歌曲")
+        entries[0].tracks[:] = [entries[2].tracks[0]]
+        self.store.save(entries, queue, volume)
+        loaded, loaded_queue, _ = self.store.load()
+        self.assertEqual(len(loaded), 3)
+        self.assertEqual(loaded[0].tracks, [second])
+        self.assertIs(loaded[0].tracks[0], loaded[2].tracks[0])
+        self.assertEqual(loaded[1].title, "编辑共享歌曲")
+        self.assertTrue(loaded[0].resolved)
+        self.assertEqual(loaded[0].cover, album.cover)
+        self.assertEqual(loaded_queue, queue)
 
     def test_nested_and_metadata_validation_on_load_protects_original(self):
         valid = asdict(LibraryEntry("专辑", "", "album", resolved=True))
@@ -182,6 +300,45 @@ class LibraryTests(unittest.TestCase):
                 self.assertEqual(self.path.read_bytes(), original)
                 self.assertFalse(self.path.with_name("library.json.v1.bak").exists())
 
+    def test_invalid_manual_metadata_on_load_preserves_original(self):
+        valid_track = asdict(Track("曲目", BVID, 101, 1))
+        valid_entry = asdict(LibraryEntry("专辑", BVID, "album", resolved=True))
+        for version in (1, 2):
+            for field in ("artist", "date"):
+                for value in (None, False, 123, [], {}):
+                    invalid_track = valid_track | {field: value}
+                    cases = (
+                        {"entries": [valid_entry | {field: value}]},
+                        {"entries": [valid_entry | {"tracks": [invalid_track]}]},
+                        {"tracks": [invalid_track]},
+                    )
+                    for case in cases:
+                        with self.subTest(version=version, field=field, value=value, case=case):
+                            original = self.write_data(version=version, **case)
+                            with self.assertRaisesRegex(ValueError, "原文件已保留"):
+                                self.store.load()
+                            with self.assertRaisesRegex(ValueError, "原文件已保留"):
+                                Store(self.path).save([], [], 40)
+                            self.assertEqual(self.path.read_bytes(), original)
+                            self.assertFalse(self.path.with_name("library.json.v1.bak").exists())
+
+    def test_mutated_manual_metadata_is_revalidated_before_save(self):
+        for target in ("entry", "nested", "queue"):
+            for field in ("artist", "date"):
+                for value in (None, False, 123, [], {}):
+                    with self.subTest(target=target, field=field, value=value):
+                        album = LibraryEntry("专辑", BVID, "album", resolved=True,
+                                             tracks=[Track("缓存曲目", BVID, 101, 1)])
+                        queue = [Track("队列曲目", BVID, 202, 2)]
+                        self.store.save([album], queue, 40)
+                        original = self.path.read_bytes()
+                        model = {"entry": album, "nested": album.tracks[0], "queue": queue[0]}[target]
+                        setattr(model, field, value)
+                        with self.assertRaises(ValueError):
+                            self.store.save([album], queue, 40)
+                        self.assertEqual(self.path.read_bytes(), original)
+                        self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
+
     def test_nested_mutations_revalidated_before_save(self):
         album = LibraryEntry("专辑", kind="album", resolved=True,
                              tracks=[Track("曲目", BVID, 101, 1)])
@@ -198,7 +355,7 @@ class LibraryTests(unittest.TestCase):
             self.assertEqual(self.path.read_bytes(), original)
 
     def test_unsupported_and_boolean_versions_are_rejected(self):
-        for version in (0, 3, True, "2"):
+        for version in (0, 4, True, "2"):
             with self.subTest(version=version):
                 original = self.write_data(version=version)
                 with self.assertRaises(ValueError):
@@ -214,6 +371,7 @@ class VideoInfoTests(unittest.TestCase):
         self.client = BilibiliClient(self.session, timeout=9)
         self.data = {
             "title": "视频原名", "pic": "//image.test/video.jpg", "owner": {"name": "作者"},
+            "pubdate": 1700000000, "ctime": 1699999999,
             "pages": [
                 {"page": 2, "cid": 202, "part": "第二首", "duration": 20},
                 {"page": 1, "cid": 101, "part": "第一首", "duration": 10},
@@ -251,15 +409,46 @@ class VideoInfoTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(BilibiliError):
                 self.client.get_video(LibraryEntry("单曲", BVID))
 
+    def test_owner_name_does_not_populate_artist_for_albums_or_singles(self):
+        for kind in ("album", "single"):
+            for method in ("get_video", "get_tracks"):
+                with self.subTest(kind=kind, method=method):
+                    self.reply()
+                    entry = LibraryEntry("导入", BVID, kind, page=1)
+                    result = getattr(self.client, method)(entry)
+                    tracks = result.tracks if isinstance(result, VideoInfo) else result
+                    self.assertEqual([track.cid for track in tracks],
+                                     [202, 101] if kind == "album" else [101])
+                    self.assertEqual([track.artist for track in tracks], [""] * len(tracks))
+                    self.assertEqual([track.date for track in tracks], [""] * len(tracks))
+
+    def test_malformed_owner_metadata_is_ignored_during_import(self):
+        for owner in (None, "UP 主", ["UP 主"], 123, True,
+                      {}, {"name": None}, {"name": ["UP 主"]}, {"name": 123}):
+            for kind in ("album", "single"):
+                for method in ("get_video", "get_tracks"):
+                    with self.subTest(owner=owner, kind=kind, method=method):
+                        self.data["owner"] = owner
+                        self.reply()
+                        result = getattr(self.client, method)(LibraryEntry("导入", BVID, kind))
+                        tracks = result.tracks if isinstance(result, VideoInfo) else result
+                        self.assertEqual(len(tracks), 2 if kind == "album" else 1)
+                        self.assertTrue(all(track.artist == "" for track in tracks))
+
     def test_get_tracks_fetches_remote_without_mutating_edited_snapshot(self):
-        edited = Track("我的标题", OTHER_BVID, 303, 3, id="preserved-track")
+        edited = Track("我的标题", OTHER_BVID, 303, 3, artist="我填写的艺术家",
+                       id="preserved-track", date="我填写的歌曲日期")
         album = LibraryEntry("我的专辑", BVID, "album", tracks=[edited],
-                             cover="https://custom.test/cover.jpg", resolved=True)
+                             cover="https://custom.test/cover.jpg", resolved=True,
+                             artist="我填写的专辑作者", date="我填写的专辑日期")
         before = copy.deepcopy(album)
         self.reply()
         fetched = self.client.get_tracks(album)
         self.assertEqual([track.cid for track in fetched], [202, 101])
+        self.assertEqual([track.artist for track in fetched], ["", ""])
+        self.assertEqual([track.date for track in fetched], ["", ""])
         self.assertEqual(album, before)
+        self.assertEqual(edited.artist, "我填写的艺术家")
         self.assertIs(album.tracks[0], edited)
         self.session.get.assert_called_once()
 

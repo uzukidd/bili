@@ -253,7 +253,7 @@ class WindowTests(unittest.TestCase):
             self.assertEqual(self.window.mini_total.text(), "3:00")
             with patch.object(self.window.player, "setPosition") as position:
                 self.window.mini_seek.setValue(60000)
-                self.window.mini_seek.sliderReleased.emit()
+                self.window.mini_seek.seekRequested.emit(60000)
                 position.assert_called_once_with(60000)
             QTest.mouseClick(self.window.expand_button, Qt.MouseButton.LeftButton)
             self.app.processEvents()
@@ -262,20 +262,23 @@ class WindowTests(unittest.TestCase):
             stop.assert_not_called()
             source.assert_not_called()
 
-    def test_mini_queue_expands_below_controls_and_restores_size(self):
+    def test_mini_queue_overlays_cover_above_controls_without_resizing(self):
         self.window.set_mini_mode(True)
         self.app.processEvents()
         compact_size = self.window.size()
+        cover_geometry = self.window.mini_cover.geometry()
         self.assertFalse(self.window.mini_queue_panel.isVisible())
         with patch.object(self.window.player, "stop") as stop:
             QTest.mouseClick(self.window.mini_queue_button, Qt.MouseButton.LeftButton)
             self.app.processEvents()
             self.assertTrue(self.window.mini_queue_panel.isVisible())
             self.assertTrue(self.window.mini_queue_button.isChecked())
-            self.assertEqual(self.window.height(), compact_size.height() + self.window._mini_queue_extra)
-            panel_top = self.window.mini_queue_panel.mapTo(self.window, self.window.mini_queue_panel.rect().topLeft()).y()
-            button_bottom = self.window.mini_queue_button.mapTo(self.window, self.window.mini_queue_button.rect().bottomLeft()).y()
-            self.assertGreater(panel_top, button_bottom)
+            self.assertEqual(self.window.size(), compact_size)
+            self.assertEqual(self.window.mini_cover.geometry(), cover_geometry)
+            panel_bottom = self.window.mini_queue_panel.mapTo(self.window, self.window.mini_queue_panel.rect().bottomLeft()).y()
+            button_top = self.window.mini_queue_button.mapTo(self.window, self.window.mini_queue_button.rect().topLeft()).y()
+            self.assertLess(panel_bottom, button_top)
+            self.assertTrue(self.window.mini_queue_panel.geometry().intersects(self.window.mini_cover.geometry()))
             self.assertTrue(self.window.queue.isVisible())
             self.assertTrue(self.window.mini_queue_empty.isVisible())
             QTest.mouseClick(self.window.mini_queue_button, Qt.MouseButton.LeftButton)
@@ -307,6 +310,8 @@ class WindowTests(unittest.TestCase):
         self.assertEqual([t.id for t in self.window._tracks()], [tracks[1].id, tracks[2].id, tracks[0].id])
         self.assertEqual(queue.currentItem().data(Qt.ItemDataRole.UserRole).id, tracks[1].id)
         self.window.set_mini_mode(True)
+        self.assertFalse(self.window.mini_queue_panel.isVisible())
+        self.window.toggle_mini_queue()
         self.assertTrue(self.window.mini_queue_panel.isVisible())
         self.assertTrue(self.window.queue.isVisible())
         self.window.clear_queue()
@@ -363,7 +368,8 @@ class WindowTests(unittest.TestCase):
         self.window.play_item(self.window.queue.item(0))
         self.assertEqual(self.window.mini_title.text(), "Song 1")
         self.assertEqual(self.window.mini_meta.text(), f"{BV} · P1")
-        self.window.entries[0].cover = "second"
+        self.window.song_for_track(tracks[1]).cover = "second"
+        self.assertEqual(self.window.entries[0].cover, "first")
         self.window.play_item(self.window.queue.item(1))
         self.assertEqual(self.window.mini_title.text(), "Song 2")
         old = QPixmap(8, 8)
@@ -496,6 +502,12 @@ class WindowTests(unittest.TestCase):
             self.assertGreater(self.window.player.duration(), 0)
             self.assertGreaterEqual(self.window.player.duration(), 1900)
             self.assertTrue(fixture.seen)
+            self.assertTrue(self.window.seek.isEnabled())
+            slider = self.window.seek
+            QTest.mouseClick(slider, Qt.MouseButton.LeftButton,
+                             pos=slider.rect().center())
+            self.assertAlmostEqual(self.window.player.position(), 1000, delta=100)
+            self.assertNotEqual(self.window.player.playbackState(), QMediaPlayer.PlaybackState.PlayingState)
         finally:
             self.window.player.setSource(QUrl())
             fixture.close()

@@ -65,21 +65,35 @@ class EntryDialog(_Dialog):
         form = QFormLayout()
         self.title_input = QLineEdit(entry.title if entry else "")
         self.title_input.setPlaceholderText(self.tr("名称可留空，导入时自动读取"))
+        cached = entry.tracks[0] if entry and entry.tracks else None
+        self.artist_input = QLineEdit(
+            (entry.artist or (cached.artist if cached else "")) if entry else "",
+        )
+        self.artist_input.setPlaceholderText(self.tr("手动填写作者（可留空）"))
+        self.date_input = QLineEdit(
+            (entry.date or (cached.date if cached else "")) if entry else "",
+        )
+        self.date_input.setPlaceholderText(self.tr("手动填写日期，例如 2025-01-01（可留空）"))
+        self.artist_label = self._label(self.tr("作者"))
+        self.date_label = self._label(self.tr("日期"))
         self.bvid_input = QLineEdit(entry.bvid if entry else "")
         self.bvid_input.setPlaceholderText(self.tr("BV 号或哔哩哔哩视频链接"))
         self.kind_input = QComboBox()
         self.kind_input.addItem(self.tr("单曲 · 导入指定分 P"), "single")
         self.kind_input.addItem(self.tr("专辑 · 导入全部分 P"), "album")
         self.kind_input.setCurrentIndex(1 if entry and entry.kind == "album" else 0)
+        self.kind_input.setEnabled(not entry or entry.kind != "single")
         self.page_input = QSpinBox()
         self.page_input.setRange(1, 10000)
         self.page_input.setValue(entry.page if entry else 1)
         self.kind_input.currentIndexChanged.connect(self._kind_changed)
-        self._kind_changed()
         form.addRow(self.tr("名称"), self.title_input)
+        form.addRow(self.artist_label, self.artist_input)
+        form.addRow(self.date_label, self.date_input)
         form.addRow(self.tr("BV / 链接"), self.bvid_input)
         form.addRow(self.tr("类型"), self.kind_input)
         form.addRow(self.tr("分 P"), self.page_input)
+        self._kind_changed()
         layout.addLayout(form)
         hint = self._label(self.tr("选择专辑会导入该视频的全部分 P。"), "muted")
         hint.setWordWrap(True)
@@ -91,7 +105,10 @@ class EntryDialog(_Dialog):
         self._buttons(layout)
 
     def _kind_changed(self, *_):
-        self.page_input.setEnabled(self.kind_input.currentData() == "single")
+        single = self.kind_input.currentData() == "single"
+        self.page_input.setEnabled(single)
+        for widget in (self.artist_input, self.artist_label, self.date_input, self.date_label):
+            widget.setVisible(single)
 
     def value(self) -> LibraryEntry:
         bvid = normalize_bvid(self.bvid_input.text())
@@ -101,6 +118,10 @@ class EntryDialog(_Dialog):
             "kind": self.kind_input.currentData(),
             "page": self.page_input.value(),
         }
+        if changes["kind"] == "single":
+            changes.update(
+                artist=self.artist_input.text().strip(), date=self.date_input.text().strip(),
+            )
         if self.entry is None:
             return LibraryEntry(**changes)
         if (bvid, changes["page"], changes["kind"]) != (
@@ -132,13 +153,17 @@ class TrackDialog(_Dialog):
         form = QFormLayout()
         self.title_input = QLineEdit(track.title)
         self.artist_input = QLineEdit(track.artist)
+        self.artist_input.setPlaceholderText(self.tr("手动填写作者（可留空）"))
+        self.date_input = QLineEdit(track.date)
+        self.date_input.setPlaceholderText(self.tr("手动填写日期，例如 2025-01-01（可留空）"))
         self.bvid_input = QLineEdit(track.bvid)
         self.bvid_input.setPlaceholderText(self.tr("BV 号或哔哩哔哩视频链接"))
         self.page_input = QSpinBox()
         self.page_input.setRange(1, 10000)
         self.page_input.setValue(track.page)
         form.addRow(self.tr("曲目名称"), self.title_input)
-        form.addRow(self.tr("艺术家"), self.artist_input)
+        form.addRow(self.tr("作者"), self.artist_input)
+        form.addRow(self.tr("日期"), self.date_input)
         form.addRow(self.tr("BV / 链接"), self.bvid_input)
         form.addRow(self.tr("分 P"), self.page_input)
         layout.addLayout(form)
@@ -157,6 +182,7 @@ class TrackDialog(_Dialog):
             raise ValueError(self.tr("请输入曲目名称。"))
         return replace(
             deepcopy(self.track), title=title, artist=self.artist_input.text().strip(),
+            date=self.date_input.text().strip(),
             bvid=normalize_bvid(self.bvid_input.text()), page=self.page_input.value(),
         )
 
@@ -208,7 +234,7 @@ class _SinglesDialog(_Dialog):
 
 
 class AlbumDialog(_Dialog):
-    """Own an isolated album snapshot until the caller commits value()."""
+    """Stage album membership; canonical song edits are saved separately."""
 
     def __init__(self, parent, entry: LibraryEntry, singles: list[LibraryEntry], language=None):
         super().__init__(parent, language)
@@ -262,9 +288,14 @@ class AlbumDialog(_Dialog):
             actions.addWidget(widget)
         actions.addStretch()
         layout.addLayout(actions)
-        hint = self._label(self.tr("拖动曲目可调整顺序；双击可编辑名称、艺术家和来源。"), "muted")
+        hint = self._label(self.tr("拖动曲目可调整顺序；双击可编辑名称、作者、日期和来源。"), "muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
+        self.song_edit_hint = self._label(self.tr(
+            "编辑歌曲会同步到所有专辑；取消此窗口只撤销专辑的增删和排序。",
+        ), "muted")
+        self.song_edit_hint.setWordWrap(True)
+        layout.addWidget(self.song_edit_hint)
         self.status_label = self._label(name="muted")
         layout.addWidget(self.status_label)
         self.error = self._label()
@@ -313,8 +344,16 @@ class AlbumDialog(_Dialog):
     def add_tracks(self, tracks: list[Track]):
         if not self._alive:
             return
+        existing = self._tracks()
+        identities = {track.id for track in existing}
+        sources = {(track.bvid, track.page) for track in existing}
         for track in tracks:
-            self._append_track(replace(deepcopy(track), id=str(uuid4())))
+            source = (track.bvid, track.page)
+            if track.id in identities or source in sources:
+                continue
+            self._append_track(deepcopy(track))
+            identities.add(track.id)
+            sources.add(source)
         self._update_controls()
 
     def remove_selected(self, *_):
@@ -401,9 +440,15 @@ class AlbumDialog(_Dialog):
 
     @staticmethod
     def _single_title(entry: LibraryEntry, tracks: list[Track]) -> list[Track]:
-        if entry.kind == "single" and entry.title.strip() and entry.title != entry.bvid:
-            return [replace(deepcopy(track), title=entry.title) for track in tracks]
-        return deepcopy(tracks)
+        changes = {}
+        if entry.kind == "single":
+            if entry.title.strip() and entry.title != entry.bvid:
+                changes["title"] = entry.title
+            if entry.artist:
+                changes["artist"] = entry.artist
+            if entry.date:
+                changes["date"] = entry.date
+        return [replace(deepcopy(track), **changes) for track in tracks]
 
     def add_bv(self, *_):
         dialog = EntryDialog(self, language=self.language)
@@ -413,7 +458,8 @@ class AlbumDialog(_Dialog):
 
         def load():
             info = BilibiliClient().get_video(source)
-            return self._single_title(source, info.tracks), info.cover
+            tracks = [replace(track, id=str(uuid4())) for track in info.tracks]
+            return self._single_title(source, tracks), info.cover
 
         def added(result):
             tracks, cover = result
@@ -432,10 +478,12 @@ class AlbumDialog(_Dialog):
             return
 
         def load():
-            client = BilibiliClient()
             tracks = []
             for entry in selected:
-                resolved = deepcopy(entry.tracks) if entry.tracks else client.get_tracks(entry)
+                if entry.tracks:
+                    resolved = deepcopy(entry.tracks)
+                else:
+                    resolved = [replace(track, id=entry.id) for track in BilibiliClient().get_tracks(entry)]
                 tracks.extend(self._single_title(entry, resolved))
             return tracks
 
@@ -446,6 +494,23 @@ class AlbumDialog(_Dialog):
         if len(selected) != 1 or self._pending or not self._alive:
             return
         original = deepcopy(selected[0].data(Qt.ItemDataRole.UserRole))
+        lookup = getattr(self.parent(), "song_for_track", None)
+        song = lookup(original, self.entry) if callable(lookup) else None
+        if song is not None:
+            self.parent().edit_single(song)
+            if not self._alive:
+                return
+            refreshed = lookup(original, self.entry)
+            for row in range(self.tracks_list.count()):
+                item = self.tracks_list.item(row)
+                if item.data(Qt.ItemDataRole.UserRole).id == original.id:
+                    if refreshed is not None and refreshed.tracks:
+                        self._format_item(item, deepcopy(refreshed.tracks[0]))
+                    else:
+                        self.tracks_list.takeItem(row)
+                    break
+            self._update_controls()
+            return
         dialog = TrackDialog(self, original, language=self.language)
         if dialog.exec() != QDialog.DialogCode.Accepted or not self._alive:
             return
@@ -472,6 +537,7 @@ class AlbumDialog(_Dialog):
                 raise ValueError(self.tr("这个视频没有可播放的分 P。"))
             return replace(
                 deepcopy(tracks[0]), id=original.id, title=edited.title, artist=edited.artist,
+                date=edited.date,
             )
 
         self._run(load, apply)

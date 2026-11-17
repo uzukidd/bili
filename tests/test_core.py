@@ -58,7 +58,30 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual(str(UUID(first.id)), first.id)
         self.assertEqual(str(UUID(track.id)), track.id)
         self.assertEqual((first.kind, first.page), ("single", 1))
-        self.assertEqual((track.artist, track.duration), ("", 0))
+        self.assertEqual((first.artist, first.date), ("", ""))
+        self.assertEqual((track.artist, track.duration, track.date), ("", 0, ""))
+
+    def test_manual_metadata_preserves_existing_positional_arguments(self):
+        track = Track("曲目", BVID, 101, 1, "手填作者", 120, "track-id", "手填日期")
+        self.assertEqual((track.artist, track.duration, track.id, track.date),
+                         ("手填作者", 120, "track-id", "手填日期"))
+        entry = LibraryEntry("专辑", BVID, "album", 2, "entry-id", [track],
+                             "https://image.test/cover.jpg", True, "专辑作者", "专辑日期")
+        self.assertEqual((entry.id, entry.tracks, entry.resolved, entry.artist, entry.date),
+                         ("entry-id", [track], True, "专辑作者", "专辑日期"))
+
+    def test_manual_metadata_accepts_empty_strings_and_rejects_non_strings(self):
+        for field in ("artist", "date"):
+            for value in ("", "手填文本", "2026-01-02", "不限定日期格式"):
+                with self.subTest(field=field, value=value):
+                    self.assertEqual(getattr(Track("", BVID, 101, 1, **{field: value}), field), value)
+                    self.assertEqual(getattr(LibraryEntry("", BVID, **{field: value}), field), value)
+            for value in (None, False, 0, 3.5, [], {}):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(ValueError):
+                        Track("曲目", BVID, 101, 1, **{field: value})
+                    with self.assertRaises(ValueError):
+                        LibraryEntry("专辑", BVID, **{field: value})
 
     def test_invalid_model_fields(self):
         for kwargs in ({"kind": "playlist"}, {"page": 0}, {"page": True}):
@@ -152,13 +175,41 @@ class ClientTests(unittest.TestCase):
         self.assertEqual([track.cid for track in tracks], [101, 202])
         self.assertEqual([track.page for track in tracks], [1, 2])
         self.assertEqual([track.duration for track in tracks], [120, 180])
-        self.assertTrue(all(track.artist == "音乐作者" for track in tracks))
+        self.assertTrue(all(track.artist == "" for track in tracks))
         self.assertEqual(self.session.headers, HEADERS)
         self.assertTrue(HEADERS["User-Agent"])
         self.assertEqual(HEADERS["Referer"], "https://www.bilibili.com/")
         self.session.get.assert_called_once_with(
             "https://api.bilibili.com/x/web-interface/view", params={"bvid": BVID}, timeout=7,
         )
+
+    def test_original_single_page_uses_video_title_for_singles_and_albums(self):
+        fixture = copy.deepcopy(VIEW)
+        fixture["data"]["pages"] = [fixture["data"]["pages"][0]]
+        fixture["data"]["pubdate"] = 1700000000
+        for kind in ("single", "album"):
+            with self.subTest(kind=kind):
+                self.reply(fixture)
+                entry = LibraryEntry("我的自定义标题", BVID, kind,
+                                     artist="手填作者", date="手填日期")
+                before = copy.deepcopy(entry)
+                response_before = copy.deepcopy(self.response.json.return_value)
+                info = self.client.get_video(entry)
+                self.assertEqual(info.title, "测试专辑")
+                self.assertEqual([track.title for track in info.tracks], ["测试专辑"])
+                self.assertEqual((info.tracks[0].artist, info.tracks[0].date), ("", ""))
+                self.assertEqual(entry, before)
+                self.assertEqual(self.response.json.return_value, response_before)
+
+    def test_multi_page_titles_survive_album_and_single_selection(self):
+        for kind, expected in (("album", ["第一首", "第二首"]), ("single", ["第二首"])):
+            with self.subTest(kind=kind):
+                self.reply(VIEW)
+                entry = LibraryEntry("我的自定义标题", BVID, kind, page=2)
+                before = copy.deepcopy(entry)
+                info = self.client.get_video(entry)
+                self.assertEqual([track.title for track in info.tracks], expected)
+                self.assertEqual(entry, before)
 
     def test_single_selects_page_number_not_list_index(self):
         fixture = copy.deepcopy(VIEW)
@@ -167,6 +218,7 @@ class ClientTests(unittest.TestCase):
         tracks = self.client.get_tracks(LibraryEntry("单曲", BVID, page=2))
         self.assertEqual(len(tracks), 1)
         self.assertEqual((tracks[0].cid, tracks[0].page, tracks[0].title), (202, 2, "第二首"))
+        self.assertEqual(tracks[0].artist, "")
 
     def test_nonexistent_page_reports_error(self):
         self.reply(VIEW)

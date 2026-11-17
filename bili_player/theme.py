@@ -26,9 +26,18 @@ QLabel#brand { font-size: 24px; font-weight: 800; color: ACCENT; }
 QLabel#heading { font-size: 26px; font-weight: 800; }
 QLabel#muted { color: MUTED; }
 QLabel#section { font-size: 16px; font-weight: 700; }
-QFrame#queuePanel, QFrame#player, QFrame#card { background: PANEL; border: 1px solid LINE;
+QLabel#cardTitle { font-size: 16px; font-weight: 600; background: transparent; }
+QLabel#cardSubtitle { font-size: 13px; color: MUTED; background: transparent; }
+QFrame#queuePanel, QFrame#player, QFrame#queueOverlay { background: PANEL; border: 1px solid LINE;
     border-radius: 14px; }
-QFrame#card:hover { border-color: ACCENT; }
+QFrame#card { background: transparent; border: 1px solid transparent; border-radius: 9px; }
+QFrame#card:hover { background: PANEL; }
+QFrame#card[dropTarget="true"] { background: SOFT; border-color: ACCENT; }
+QPushButton#cardArtwork, QPushButton#hoverPlay { border: none; background: transparent; padding: 0; }
+QPushButton[flatIcon="true"] { border: none; background: transparent; padding: 4px; }
+QPushButton[flatIcon="true"]:hover, QPushButton[flatIcon="true"]:checked {
+    border: none; background: SOFT; }
+QPushButton[flatIcon="true"]:checked { color: ACCENT; }
 QPushButton { border: 1px solid LINE; background: PANEL; border-radius: 8px; padding: 8px 12px; }
 QPushButton:hover { background: SOFT; border-color: ACCENT; }
 QPushButton:disabled { color: DISABLED; }
@@ -41,6 +50,13 @@ QComboBox QAbstractItemView { background: PANEL; color: TEXT; selection-backgrou
 QTabBar::tab { padding: 9px 20px; color: MUTED; border-bottom: 2px solid transparent; }
 QTabBar::tab:selected { color: ACCENT; border-bottom-color: ACCENT; font-weight: 700; }
 QScrollArea { border: none; background: transparent; }
+QWidget#detailContent { background: BG; }
+QFrame#detailSticky { background: PANEL; border-bottom: 1px solid LINE; }
+QFrame#detailTrack { background: transparent; border-bottom: 1px solid LINE; }
+QFrame#detailTrack QPushButton { padding: 4px 12px; }
+QListWidget#detailTracks { background: transparent; }
+QListWidget#detailTracks::item { padding: 0; margin: 0; border-radius: 0; }
+QListWidget#detailTracks::item:selected, QListWidget#detailTracks::item:hover { background: SOFT; }
 QListWidget { background: PANEL; border: none; border-radius: 8px; outline: none; }
 QListWidget::item { padding: 10px 6px; margin: 2px 0; border-radius: 7px; }
 QListWidget::item:selected { background: SOFT; color: TEXT; }
