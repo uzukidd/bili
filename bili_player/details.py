@@ -1,20 +1,18 @@
 """Scrollable entry details and explicit per-track actions."""
 from __future__ import annotations
 
-from dataclasses import replace
-from uuid import uuid4
-
 from PyQt6 import sip
-from PyQt6.QtCore import QEvent, QPointF, QRectF, QSize, Qt
-from PyQt6.QtGui import QMouseEvent, QPainter, QPainterPath, QPixmap
+from PyQt6.QtCore import QEvent, QItemSelectionModel, QPointF, QRectF, QSize, Qt
+from PyQt6.QtGui import QKeySequence, QMouseEvent, QPainter, QPainterPath, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
-    QLabel, QListWidget, QListWidgetItem, QPushButton, QScrollArea, QSizePolicy,
+    QLabel, QListWidget, QListWidgetItem, QMenu, QPushButton, QScrollArea, QSizePolicy,
     QVBoxLayout, QWidget, QStyledItemDelegate,
 )
 
 from .i18n import translate
 from .models import LibraryEntry, Track
+from .window_chrome import FramelessController, TitleBar
 
 
 def _duration(seconds: int) -> str:
@@ -91,23 +89,33 @@ class TrackRow(QFrame):
             actions.addWidget(widget)
         actions.addStretch()
         layout.addLayout(actions)
-        for widget in (self, self.title_label, self.metadata_label):
+        for widget in (self, self.title_label, self.metadata_label, self.play_button, self.insert_button):
             widget.installEventFilter(self)
 
     def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.ContextMenu:
+            self.details.show_track_menu(self.item, event.globalPos())
+            return True
+        if watched in (self.play_button, self.insert_button):
+            return super().eventFilter(watched, event)
         if event.type() == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton:
-            self.details.tracks_list.itemDoubleClicked.emit(self.item)
+            if not self.details._selection_mode:
+                self.details.tracks_list.itemDoubleClicked.emit(self.item)
             event.accept()
             return True
         if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease) and event.button() == Qt.MouseButton.LeftButton:
-            # Item widgets consume clicks before QListWidget can apply Ctrl/Shift selection.
-            viewport = self.details.tracks_list.viewport()
-            position = viewport.mapFromGlobal(event.globalPosition().toPoint())
-            forwarded = QMouseEvent(
-                event.type(), QPointF(position), event.globalPosition(), event.button(),
-                event.buttons(), event.modifiers(),
-            )
-            QApplication.sendEvent(viewport, forwarded)
+            if self.details._selection_mode:
+                # Forward selection clicks through the row widget. Plain clicks toggle a row.
+                viewport = self.details.tracks_list.viewport()
+                position = viewport.mapFromGlobal(event.globalPosition().toPoint())
+                modifiers = event.modifiers()
+                if not modifiers & Qt.KeyboardModifier.ShiftModifier:
+                    modifiers |= Qt.KeyboardModifier.ControlModifier
+                forwarded = QMouseEvent(
+                    event.type(), QPointF(position), event.globalPosition(), event.button(),
+                    event.buttons(), modifiers,
+                )
+                QApplication.sendEvent(viewport, forwarded)
             event.accept()
             return True
         return super().eventFilter(watched, event)
@@ -116,20 +124,28 @@ class TrackRow(QFrame):
 class EntryDetailsDialog(QDialog):
     """One outer scroll keeps the album hero and track rows moving together."""
 
-    def __init__(self, parent, entry: LibraryEntry, language=None, *, album_id=None, track_id=None):
+    def __init__(self, parent, entry: LibraryEntry, language=None, *, album_id=None, track_id=None, owner=None):
         super().__init__(parent)
-        self._owner = parent
+        self._owner = owner if owner is not None else parent
         self.entry = entry
         self._album_id, self._track_id = album_id, track_id
-        self.language = language or getattr(parent, "language", "zh_CN") or "zh_CN"
+        self.language = language or getattr(self._owner, "language", "zh_CN") or "zh_CN"
+        self._selection_mode = False
         self._cover_source = None
         self.track_rows = []
         self.setObjectName("root")
+        self._frameless_controller = FramelessController(self)
         self.setMinimumSize(640, 500)
         self.resize(780, 680)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 16, 20, 16)
+        window_layout = QVBoxLayout(self)
+        window_layout.setContentsMargins(1, 1, 1, 1)
+        window_layout.setSpacing(0)
+        self.title_bar = TitleBar(self, self.language)
+        window_layout.addWidget(self.title_bar)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(20, 8, 20, 16)
         layout.setSpacing(12)
+        window_layout.addLayout(layout, 1)
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -210,7 +226,10 @@ class EntryDetailsDialog(QDialog):
         self.tracks_list = QListWidget()
         self.tracks_list.setObjectName("detailTracks")
         self.tracks_list.setItemDelegate(TrackDelegate(self.tracks_list))
-        self.tracks_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tracks_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._selection_escape = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._selection_escape.setEnabled(False)
+        self._selection_escape.activated.connect(self.exit_track_selection)
         self.tracks_list.itemSelectionChanged.connect(self._update_selection_controls)
         self.tracks_list.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         self.tracks_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -268,6 +287,9 @@ class EntryDetailsDialog(QDialog):
         return widget
 
     def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.ContextMenu and watched is self.tracks_list.viewport():
+            self.show_track_menu(self.tracks_list.itemAt(event.pos()), event.globalPos())
+            return True
         if event.type() == QEvent.Type.Wheel:
             bar = self.scroll_area.verticalScrollBar()
             pixels = event.pixelDelta().y()
@@ -376,8 +398,6 @@ class EntryDetailsDialog(QDialog):
         self.tracks_list.setFixedHeight(max(1, len(entry.tracks) * 114 + 2))
         self.tracks_list.setVisible(not is_single and bool(entry.tracks))
         self.track_heading.setVisible(not is_single)
-        self.selection_toolbar.setVisible(not is_single)
-        self.batch_toolbar.setVisible(not is_single)
         self._update_selection_controls()
         self.empty_label.setVisible(not is_single and not entry.tracks)
         self.copy_button.setEnabled(True)
@@ -406,13 +426,61 @@ class EntryDetailsDialog(QDialog):
                     identities.append(identity)
         return identities
 
+    def enter_track_selection(self, identity):
+        for row in range(self.tracks_list.count()):
+            item = self.tracks_list.item(row)
+            track = item.data(Qt.ItemDataRole.UserRole)
+            if (track.song_id or track.id) == identity:
+                self._selection_mode = True
+                self.tracks_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+                self.tracks_list.setCurrentItem(item, QItemSelectionModel.SelectionFlag.NoUpdate)
+                item.setSelected(True)
+                self._update_selection_controls()
+                return
+
+    def exit_track_selection(self):
+        self._selection_mode = False
+        self.tracks_list.clearSelection()
+        self.tracks_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._update_selection_controls()
+
+    def show_track_menu(self, item, position):
+        track = self._track(item)
+        if track is None:
+            return
+        album_id = self.entry.id
+        identity = track.song_id or track.id
+        if self._selection_mode and item.isSelected() and len(self.tracks_list.selectedItems()) > 1:
+            menu = QMenu(self)
+            for button in (self.batch_queue_button, self.batch_copy_button, self.batch_remove_button):
+                menu.addAction(button.text(), button.click)
+        else:
+            song = self._owner.song_for_track(track, self.entry)
+            if song is None:
+                return
+            menu = self._owner._build_entry_menu(song, parent=self, select=self.enter_track_selection)
+            menu.addAction(self.tr("从专辑移除"),
+                           lambda: self._owner.batch_remove_album_tracks(album_id, [identity]))
+        try:
+            menu.exec(position)
+        finally:
+            menu.deleteLater()
+
     def _update_selection_controls(self):
         count = len(self.tracks_list.selectedItems())
+        is_album = self.entry.kind == "album"
+        active = is_album and self._selection_mode
+        selecting = active and count > 0
+        self.selection_toolbar.setVisible(active)
+        self.batch_toolbar.setVisible(active)
+        self._selection_escape.setEnabled(active)
         self.selection_label.setText(self.tr("已选择 {count} 首", count=count))
-        self.select_all_button.setEnabled(self.tracks_list.count() > count)
-        self.clear_selection_button.setEnabled(bool(count))
+        self.selection_label.setVisible(active)
+        self.select_all_button.setEnabled(active and self.tracks_list.count() > count)
+        self.clear_selection_button.setVisible(selecting)
+        self.clear_selection_button.setEnabled(selecting)
         for button in (self.batch_queue_button, self.batch_copy_button, self.batch_remove_button):
-            button.setEnabled(bool(count))
+            button.setEnabled(selecting)
 
     def _batch_action(self, method):
         selected = self.selected_song_ids()
@@ -459,11 +527,8 @@ class EntryDetailsDialog(QDialog):
 
     def _play_track(self, item):
         track = self._track(item)
-        if track is None:
-            return
-        self._owner._append_tracks([replace(track, id=str(uuid4()))])
-        queue = self._owner.queue
-        self._owner.play_item(queue.item(queue.count() - 1))
+        if track is not None:
+            self._owner.play_tracks([track])
 
     def _insert_track(self, item):
         track = self._track(item)

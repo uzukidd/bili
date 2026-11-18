@@ -32,6 +32,7 @@ class DetailsParent(QWidget):
         self.queue = QListWidget(self)
         self.appended = []
         self.resolve_entry = Mock()
+        self.play_tracks = Mock()
         self.play_item = Mock()
         self.open_album = Mock()
         self.edit_single = Mock()
@@ -130,20 +131,12 @@ class DetailsTests(unittest.TestCase):
         self.assertEqual(self.parent.appended, [])
         self.parent.play_item.assert_not_called()
 
-    def test_track_play_button_copies_only_selected_track_with_fresh_ids(self):
+    def test_track_play_button_uses_shared_playback_for_selected_song(self):
         dialog = self.dialog()
-        original = asdict(self.tracks[1])
         dialog.track_rows[1].play_button.click()
-        dialog.track_rows[1].play_button.click()
-        self.assertEqual(len(self.parent.appended), 2)
-        first, second = self.parent.appended
-        self.assertIsNot(first, self.tracks[1])
-        self.assertNotEqual(first.id, self.tracks[1].id)
-        self.assertNotEqual(second.id, first.id)
-        self.assertEqual(replace(first, id=self.tracks[1].id), self.tracks[1])
-        self.assertEqual(asdict(self.tracks[1]), original)
-        self.assertEqual(self.parent.play_item.call_count, 2)
-        self.assertIs(self.parent.play_item.call_args.args[0], self.parent.queue.item(1))
+        self.parent.play_tracks.assert_called_once_with([self.tracks[1]])
+        self.assertEqual(self.parent.appended, [])
+        self.parent.play_item.assert_not_called()
         self.parent.resolve_entry.assert_not_called()
         self.parent.open_track_details.assert_not_called()
 

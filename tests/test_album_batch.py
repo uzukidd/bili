@@ -67,22 +67,54 @@ class AlbumBatchTests(unittest.TestCase):
         QTest.mouseClick(widget, Qt.MouseButton.LeftButton, modifiers, QPoint(12, 10))
         self.app.processEvents()
 
-    def test_custom_row_clicks_support_plain_ctrl_and_shift_selection(self):
-        self.assertEqual(self.dialog.tracks_list.selectionMode(), QAbstractItemView.SelectionMode.ExtendedSelection)
+    def test_plain_click_does_not_select_and_selection_mode_supports_ctrl_and_shift(self):
+        self.assertEqual(self.dialog.tracks_list.selectionMode(), QAbstractItemView.SelectionMode.NoSelection)
         self.click_row(0)
+        self.click_row(2, Qt.KeyboardModifier.ControlModifier, "metadata_label")
+        self.assertEqual(self.dialog.selected_song_ids(), [])
+        self.assertTrue(self.dialog.selection_toolbar.isHidden())
+        self.dialog.enter_track_selection("song-0")
         self.assertEqual(self.dialog.selected_song_ids(), ["song-0"])
         self.click_row(2, Qt.KeyboardModifier.ControlModifier, "metadata_label")
         self.assertEqual(self.dialog.selected_song_ids(), ["song-0", "song-2"])
         self.click_row(3, Qt.KeyboardModifier.ShiftModifier)
         self.assertEqual(self.dialog.selected_song_ids(), ["song-0", "song-2", "song-3"])
         self.click_row(1)
-        self.assertEqual(self.dialog.selected_song_ids(), ["song-1"])
+        self.assertEqual(self.dialog.selected_song_ids(), ["song-0", "song-1", "song-2", "song-3"])
+
+    def test_batch_toolbar_hides_until_selection_and_escape_exits_selection(self):
+        dialog = self.dialog
+        self.assertTrue(dialog.batch_toolbar.isHidden())
+        self.dialog.enter_track_selection("song-0")
+        self.click_row(2, Qt.KeyboardModifier.ControlModifier)
+        self.assertTrue(dialog.batch_toolbar.isVisible())
+        self.assertEqual(dialog.selected_song_ids(), ["song-0", "song-2"])
+        dialog.tracks_list.setFocus()
+        QTest.keyClick(dialog.tracks_list, Qt.Key.Key_Escape)
+        self.assertTrue(dialog.isVisible())
+        self.assertEqual(dialog.selected_song_ids(), [])
+        self.assertTrue(dialog.batch_toolbar.isHidden())
+        QTest.keyClick(dialog.tracks_list, Qt.Key.Key_Escape)
+        self.assertFalse(dialog.isVisible())
+
+    def test_album_and_single_details_use_frameless_title_controls(self):
+        for dialog in (self.dialog, self.open_details(self.parent.single)):
+            with self.subTest(kind=dialog.entry.kind):
+                self.assertTrue(dialog.windowFlags() & Qt.WindowType.FramelessWindowHint)
+                self.assertEqual(dialog.title_bar.title_label.text(), dialog.windowTitle())
+                QTest.mouseClick(dialog.title_bar.maximize_button, Qt.MouseButton.LeftButton)
+                self.assertTrue(dialog.isMaximized())
+                QTest.mouseClick(dialog.title_bar.maximize_button, Qt.MouseButton.LeftButton)
+                self.assertFalse(dialog.isMaximized())
+                QTest.mouseClick(dialog.title_bar.close_button, Qt.MouseButton.LeftButton)
+                self.assertFalse(dialog.isVisible())
 
     def test_select_all_clear_and_batch_controls(self):
         dialog = self.dialog
         self.assertFalse(dialog.batch_queue_button.isEnabled())
         self.assertFalse(dialog.batch_copy_button.isEnabled())
         self.assertFalse(dialog.batch_remove_button.isEnabled())
+        dialog.enter_track_selection("song-0")
         dialog.select_all_button.click()
         self.assertEqual(dialog.selected_song_ids(), [f"song-{i}" for i in range(4)])
         self.assertEqual(dialog.selection_label.text(), "已选择 4 首")
@@ -94,6 +126,7 @@ class AlbumBatchTests(unittest.TestCase):
 
     def test_bulk_actions_delegate_song_ids_in_album_order_without_source_deduplication(self):
         dialog = self.dialog
+        dialog.enter_track_selection("song-1")
         for row in (3, 1):
             dialog.tracks_list.item(row).setSelected(True)
         for button, method in ((dialog.batch_queue_button, self.parent.batch_queue_tracks),
@@ -105,7 +138,7 @@ class AlbumBatchTests(unittest.TestCase):
         self.assertEqual(len(self.parent.album.tracks), 4)
 
     def test_refresh_preserves_selection_by_song_id_after_reference_ids_and_order_change(self):
-        self.dialog.tracks_list.item(1).setSelected(True)
+        self.dialog.enter_track_selection("song-1")
         self.parent.album.tracks = [replace(track, id=f"new-{track.id}")
                                     for track in reversed(self.parent.tracks)]
         self.parent.libraryChanged.emit()
@@ -114,7 +147,7 @@ class AlbumBatchTests(unittest.TestCase):
 
     def test_remove_refreshes_rows_and_keeps_song_entity(self):
         dialog = self.dialog
-        dialog.tracks_list.item(0).setSelected(True)
+        dialog.enter_track_selection("song-0")
         dialog.tracks_list.item(2).setSelected(True)
 
         def remove(album_id, song_ids):
@@ -129,7 +162,7 @@ class AlbumBatchTests(unittest.TestCase):
         self.assertIn(self.parent.single, self.parent.entries)
 
     def test_stale_removed_selection_is_not_sent_to_parent(self):
-        self.dialog.tracks_list.item(0).setSelected(True)
+        self.dialog.enter_track_selection("song-0")
         self.parent.album.tracks = self.parent.tracks[1:]
         self.dialog.batch_queue_button.click()
         self.parent.batch_queue_tracks.assert_not_called()
@@ -137,10 +170,11 @@ class AlbumBatchTests(unittest.TestCase):
         self.assertEqual(self.dialog.selected_song_ids(), [])
 
     def test_row_buttons_do_not_change_selection_and_double_click_opens_details(self):
-        self.click_row(1)
+        self.dialog.enter_track_selection("song-1")
         self.dialog.track_rows[0].insert_button.click()
         self.parent.insert_track_next.assert_called_once_with(self.parent.tracks[0])
         self.assertEqual(self.dialog.selected_song_ids(), ["song-1"])
+        self.dialog.exit_track_selection()
         QTest.mouseDClick(self.dialog.track_rows[0].title_label, Qt.MouseButton.LeftButton, pos=QPoint(12, 10))
         self.parent.open_track_details.assert_called_once_with(self.parent.tracks[0], self.parent.album)
 

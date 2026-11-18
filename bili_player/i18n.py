@@ -122,6 +122,7 @@ ENGLISH = {
     "音量": "Volume", "正在播放": "Playing", "已暂停": "Paused",
     "正在读取 {title}…": "Loading {title}…",
     "已加入队列 · {count} 首": "Added {count} tracks to queue",
+    "这些歌曲已在播放队列中": "These songs are already in the queue",
     "正在获取音频地址…": "Resolving audio stream…", "正在缓冲音频…": "Buffering audio…",
     "已播放到队列末尾": "Reached the end of the queue", "队列已清空": "Queue cleared",
     "移出队列": "Remove from queue", "这个专辑还没有歌曲，先添加几首吧。": "This album is empty. Add a few tracks first.",

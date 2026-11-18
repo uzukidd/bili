@@ -1,8 +1,75 @@
 """Reusable controls that distinguish user seeking from playback updates."""
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QSlider, QStyle, QStyleOptionSlider
+from html import escape
+
+from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QPainter, QTextLayout, QTextOption
+from PyQt6.QtWidgets import QLabel, QSizePolicy, QSlider, QStyle, QStyleOptionSlider
+
+
+class PlaybackTitleLabel(QLabel):
+    """Show two complete lines and keep the original title available on hover."""
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("section")
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+
+    def setText(self, text: str):
+        super().setText(text)
+        self.setToolTip(f"<qt>{escape(text)}</qt>" if text else "")
+
+    def sizeHint(self):
+        return self.minimumSizeHint()
+
+    def minimumSizeHint(self):
+        return QSize(0, self.fontMetrics().height() + self.fontMetrics().lineSpacing())
+
+    def _title_layout(self, width):
+        # A song title reads as one paragraph, even when the source includes line breaks.
+        title = " ".join(self.text().split())
+        layout = QTextLayout(title, self.font())
+        option = QTextOption()
+        option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        layout.setTextOption(option)
+        metrics = self.fontMetrics()
+        layout.beginLayout()
+        for row in range(2):
+            line = layout.createLine()
+            if not line.isValid():
+                break
+            line.setLineWidth(width)
+            line.setPosition(QPointF(0, row * metrics.lineSpacing()))
+        layout.endLayout()
+        last_line = None
+        if layout.lineCount() == 2:
+            # QTextLayout indexes UTF-16 code units, including surrogate pairs in emoji.
+            second = layout.lineAt(1)
+            encoded = title.encode("utf-16-le")
+            if (second.textStart() + second.textLength()) * 2 < len(encoded):
+                remainder = encoded[second.textStart() * 2:].decode("utf-16-le")
+                last_line = metrics.elidedText(remainder, Qt.TextElideMode.ElideRight, width)
+        return layout, last_line
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        painter.setFont(self.font())
+        layout, last_line = self._title_layout(self.width())
+        if layout.lineCount() == 0:
+            return
+        line_count = min(layout.lineCount(), 2)
+        height = self.fontMetrics().height() + (line_count - 1) * self.fontMetrics().lineSpacing()
+        top = max(0, (self.height() - height) / 2)
+        for row in range(line_count):
+            if row == 1 and last_line is not None:
+                painter.drawText(QRectF(0, top + self.fontMetrics().lineSpacing(), self.width(),
+                                        self.fontMetrics().height()),
+                                 Qt.AlignmentFlag.AlignLeading | Qt.AlignmentFlag.AlignVCenter, last_line)
+            else:
+                layout.lineAt(row).draw(painter, QPointF(0, top))
 
 
 class SeekSlider(QSlider):

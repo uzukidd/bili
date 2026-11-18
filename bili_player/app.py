@@ -29,6 +29,7 @@ from .catalog import normalize_library, merge_libraries, find_song, delete_song,
 from .cards import CardArtwork, LibraryCard, LibraryGrid
 from .covers import CoverCache
 from .details import EntryDetailsDialog
+from .dialog_dimming import install_dialog_dimming
 from .dialogs import AlbumDialog, EntryDialog
 from .exchange import read_library, write_library
 from .i18n import translate, translate_error
@@ -37,7 +38,7 @@ from .models import LibraryEntry, Store, Track
 from .playback_order import ShuffleOrder
 from .window_chrome import TitleBar, FramelessController
 from .stream import StreamProxy
-from .widgets import SeekSlider
+from .widgets import PlaybackTitleLabel, SeekSlider
 from .theme import PALETTES, apply_theme, stylesheet
 
 STYLE = stylesheet("light")
@@ -223,6 +224,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, store_path: Path | None = None):
         super().__init__()
+        install_dialog_dimming()
         self._frameless_controller = FramelessController(self)
         self.resize(1220, 820)
         self.setMinimumSize(1020, 700)
@@ -250,6 +252,7 @@ class MainWindow(QMainWindow):
         self.current_id: str | None = None
         self._request = 0
         self._library_request = 0
+        self._entry_play_request = 0
         self._queue_epoch = 0
         self._closing = False
         self._quitting = False
@@ -339,6 +342,9 @@ class MainWindow(QMainWindow):
         shell_layout.addWidget(self.pages, 1)
         self.setCentralWidget(shell)
         self.pages.addWidget(root)
+        self._selection_escape = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._selection_escape.setEnabled(False)
+        self._selection_escape.activated.connect(self.exit_library_selection)
         outer = QVBoxLayout(root)
         outer.setContentsMargins(26, 20, 26, 18)
         outer.setSpacing(16)
@@ -409,6 +415,7 @@ class MainWindow(QMainWindow):
         batch_tools = QHBoxLayout(self.selection_tools)
         batch_tools.setContentsMargins(0, 0, 0, 0)
         self.exit_selection_button = self._button("退出多选", self.exit_library_selection)
+        self.select_all_button = self._button("全选", self.select_all_library)
         self.batch_copy_button = self._button("复制", lambda: self.copy_library_entries(
             [entry.id for entry in self._selected_library_entries()]))
         self.batch_delete_button = self._button("删除", lambda: self.delete_library_entries(
@@ -416,7 +423,7 @@ class MainWindow(QMainWindow):
         self.batch_export_button = self._button("批量导出", lambda: None)
         self.batch_export_button.setEnabled(False)
         self._bind(self.batch_export_button, "暂未实现", "setToolTip")
-        for widget in (self.exit_selection_button, self.batch_copy_button,
+        for widget in (self.exit_selection_button, self.select_all_button, self.batch_copy_button,
                        self.batch_delete_button, self.batch_export_button):
             batch_tools.addWidget(widget)
         self.selection_count = label(name="muted")
@@ -473,9 +480,7 @@ class MainWindow(QMainWindow):
         controls = QVBoxLayout(player_frame)
         controls.setContentsMargins(18, 14, 18, 14)
         top = QHBoxLayout()
-        self.now_title = label(name="section")
-        self.now_title.setWordWrap(True)
-        self.now_title.setMaximumWidth(350)
+        self.now_title = PlaybackTitleLabel()
         self.now_meta = label(name="muted")
         meta = QVBoxLayout()
         meta.addWidget(self.now_title)
@@ -739,6 +744,7 @@ class MainWindow(QMainWindow):
         if enabled == self._mini_mode:
             return
         self._mini_mode = enabled
+        self._selection_escape.setEnabled(self._selection_mode and not enabled)
         if enabled:
             self._normal_maximized = self.isMaximized()
             self._normal_geometry = self.normalGeometry() if self._normal_maximized else self.geometry()
@@ -970,6 +976,10 @@ class MainWindow(QMainWindow):
 
     def _refresh_library_selection(self):
         self.selection_tools.setVisible(self._selection_mode)
+        self._selection_escape.setEnabled(self._selection_mode and not self._mini_mode)
+        self.select_all_button.setEnabled(any(
+            identity not in self._selected_entry_ids for identity in self._visible_entry_ids
+        ))
         self.selection_count.setText(self.tr("已选择 {count} 项", count=len(self._selected_entry_ids)))
         for widget in (self.batch_copy_button, self.batch_delete_button):
             widget.setEnabled(bool(self._selected_entry_ids))
@@ -1034,7 +1044,7 @@ class MainWindow(QMainWindow):
                 if epoch != self._queue_epoch:
                     return
                 if self._find(current.id) is not None:
-                    self._append_tracks(copy_tracks(current.tracks))
+                    self._append_unique_tracks(current.tracks)
                 append_next()
             self._ensure_entry(entry, ready, lambda message: (self._error(message), append_next()))
         append_next()
@@ -1045,7 +1055,7 @@ class MainWindow(QMainWindow):
             self._error(self.tr("还没有专辑，请先新建一个。"))
             return
         choices = [f"{index + 1}. {entry.title}" for index, entry in enumerate(albums)]
-        chosen, accepted = QInputDialog.getItem(self, self.tr("加入专辑"), self.tr("请选择专辑"), choices, 0, False)
+        chosen, accepted = QInputDialog.getItem(self._dialog_host(), self.tr("加入专辑"), self.tr("请选择专辑"), choices, 0, False)
         if accepted:
             album = albums[choices.index(chosen)]
             for identity in identities:
@@ -1072,7 +1082,7 @@ class MainWindow(QMainWindow):
         if album is None or album.kind != "album":
             return
         selected = set(song_ids)
-        self._append_tracks(copy_tracks([track for track in album.tracks if (track.song_id or track.id) in selected]))
+        self._append_unique_tracks(track for track in album.tracks if (track.song_id or track.id) in selected)
 
     def batch_copy_tracks(self, album_id, song_ids):
         album = self._find(album_id)
@@ -1353,12 +1363,21 @@ class MainWindow(QMainWindow):
 
         self._submit(lambda: BilibiliClient().get_video(entry), loaded, failed)
 
+    def _dialog_host(self):
+        dialog = QApplication.activeModalWidget()
+        ancestor = dialog
+        while ancestor is not None and ancestor is not self:
+            ancestor = ancestor.parentWidget()
+        return dialog if ancestor is self else self
+
     def open_entry(self, entry: LibraryEntry):
         if entry is None:
             return
 
         def opened(current):
-            dialog = EntryDetailsDialog(self, current)
+            host = self._dialog_host()
+            dialog = (EntryDetailsDialog(self, current) if host is self else
+                      EntryDetailsDialog(host, current, owner=self))
             try:
                 dialog.exec()
             finally:
@@ -1387,7 +1406,7 @@ class MainWindow(QMainWindow):
                 return
             self._editing_albums.add(album.id)
             try:
-                dialog = AlbumDialog(self, album, [e for e in self.entries if e.kind == "single"])
+                dialog = AlbumDialog(self._dialog_host(), album, [e for e in self.entries if e.kind == "single"])
                 if dialog.exec() == QDialog.DialogCode.Accepted:
                     self.save_album(dialog.value())
             finally:
@@ -1462,7 +1481,7 @@ class MainWindow(QMainWindow):
             self._error(self.tr("还没有专辑，请先新建一个。"))
             return
         choices = [f"{i + 1}. {e.title}" for i, e in enumerate(albums)]
-        chosen, accepted = QInputDialog.getItem(self, self.tr("加入专辑"), self.tr("请选择专辑"), choices, 0, False)
+        chosen, accepted = QInputDialog.getItem(self._dialog_host(), self.tr("加入专辑"), self.tr("请选择专辑"), choices, 0, False)
         if accepted:
             self.add_single_to_album(entry, albums[choices.index(chosen)])
 
@@ -1513,7 +1532,7 @@ class MainWindow(QMainWindow):
         current = self._find(entry.id)
         if current is None or current.kind != "single":
             return
-        dialog = EntryDialog(self, current)
+        dialog = EntryDialog(self._dialog_host(), current)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         updated = dialog.value()
@@ -1583,8 +1602,9 @@ class MainWindow(QMainWindow):
         self.libraryChanged.emit()
         return True
 
-    def _build_entry_menu(self, entry):
-        menu = QMenu(self)
+    def _build_entry_menu(self, entry, *, parent=None, select=None):
+        menu = QMenu(self if parent is None else parent)
+        select = self.enter_library_selection if select is None else select
 
         def action(key, text, callback):
             item = menu.addAction(self.tr(text))
@@ -1597,7 +1617,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         action("details", "打开专辑" if entry.kind == "album" else "打开单曲详情", lambda: self.open_entry(entry))
         action("edit", "编辑专辑" if entry.kind == "album" else "编辑", lambda: self.open_album(entry) if entry.kind == "album" else self.edit_single(entry))
-        action("select", "多选", lambda: self.enter_library_selection(entry.id))
+        action("select", "多选", lambda: select(entry.id))
         action("copy", "复制", lambda: self.copy_library_entries([entry.id]))
         if entry.kind == "single":
             action("add_album", "加入专辑…", lambda: self._choose_album(entry))
@@ -1629,26 +1649,51 @@ class MainWindow(QMainWindow):
         self._library_request += 1
         request = self._library_request
         if play:
-            self._request += 1
-        generation, epoch = self._request, self._queue_epoch
+            self._entry_play_request += 1
+        generation, epoch = self._entry_play_request, self._queue_epoch
 
         def done(snapshot):
-            if epoch != self._queue_epoch or (play and generation != self._request):
+            if epoch != self._queue_epoch or (play and generation != self._entry_play_request):
                 return
             if not snapshot.tracks:
                 self._status("这个专辑还没有歌曲，先添加几首吧。")
                 return
-            tracks = copy_tracks(snapshot.tracks)
-            self._append_tracks(tracks)
-            self._status("已加入队列 · {count} 首", count=len(tracks))
             if play:
-                self.play_item(self.queue.item(self.queue.count() - len(tracks)))
+                self.play_tracks(snapshot.tracks)
+                return
+            count = self._append_unique_tracks(snapshot.tracks)
+            if count:
+                self._status("已加入队列 · {count} 首", count=count)
+            else:
+                self._status("这些歌曲已在播放队列中")
 
         def failed(message):
-            if epoch == self._queue_epoch and ((play and generation == self._request) or (not play and request == self._library_request)):
+            if epoch != self._queue_epoch:
+                return
+            if (play and generation == self._entry_play_request) or (not play and request == self._library_request):
                 self._error(message)
 
         self._ensure_entry(entry, done, failed)
+
+    def play_tracks(self, tracks: list[Track]):
+        if not tracks:
+            return
+        queued = copy_tracks(tracks)
+        self._discard_queue_items()
+        self._append_tracks(queued)
+        self.play_item(self.queue.item(0))
+
+    def _append_unique_tracks(self, tracks):
+        queued_ids = {track.song_id or track.id for track in self._tracks()}
+        missing = []
+        for track in tracks:
+            identity = track.song_id or track.id
+            if identity not in queued_ids:
+                queued_ids.add(identity)
+                missing.append(track)
+        if missing:
+            self._append_tracks(copy_tracks(missing))
+        return len(missing)
 
     def _append_tracks(self, tracks: list[Track], persist=True):
         for track in tracks:
@@ -1687,6 +1732,7 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         track = item.data(Qt.ItemDataRole.UserRole)
+        self._entry_play_request += 1
         self._reset_playback_recovery()
         self._want_playing = True
         self._loading_stream = True
@@ -1846,18 +1892,21 @@ class MainWindow(QMainWindow):
                 return
         self.play_item(self.queue.item(next_row))
 
-    def clear_queue(self):
+    def _discard_queue_items(self):
         self._play_next_priority.clear()
         self.shuffle_order.reset()
-        self._reset_playback_recovery()
-        self._request += 1
         self._library_request += 1
         self._queue_epoch += 1
+        self.current_id = None
+        self.queue.clear()
+
+    def clear_queue(self):
+        self._reset_playback_recovery()
+        self._request += 1
+        self._discard_queue_items()
         self.player.stop()
         self.player.setSource(QUrl())
         self.proxy.release_stream()
-        self.current_id = None
-        self.queue.clear()
         self.now_title.setText(self.tr("还没有正在播放的音乐"))
         self.now_meta.setText(self.tr("从音乐库点击播放"))
         self._sync_mini_text()
@@ -1980,7 +2029,7 @@ class MainWindow(QMainWindow):
     def _error(self, message: str):
         message = translate_error(message, self.language)
         self.status.setText(message.replace("\n", " "))
-        QMessageBox.warning(self, "Bili Music", message)
+        QMessageBox.warning(self._dialog_host(), "Bili Music", message)
 
     def closeEvent(self, event):
         if not self._quitting and QSystemTrayIcon.isSystemTrayAvailable():

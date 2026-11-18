@@ -295,6 +295,10 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(source.title, "Shared title")
         self.window.resolve_entry(album, False)
         self.window.resolve_entry(album, False)
+        self.assertEqual(len(self.window._tracks()), 1)
+        self.window.resolve_entry(source, False)
+        self.assertEqual(len(self.window._tracks()), 1)
+        self.window.insert_track_next(source.tracks[0])
         queue = self.window._tracks()
         occurrence_ids = [t.id for t in queue]
         self.assertEqual(len(set(occurrence_ids)), 2)

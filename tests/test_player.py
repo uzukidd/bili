@@ -138,6 +138,22 @@ class WindowTests(unittest.TestCase):
     def tracks(self):
         return [Track(title=f"Song {i}", bvid=BV, cid=i, page=i) for i in (1, 2, 3)]
 
+    def test_main_playback_title_wraps_without_clipping_and_keeps_full_tooltip(self):
+        self.window.resize(self.window.minimumSize())
+        title = self.window.now_title
+        original = "【现场演出】🎵 Covered by 一家 Dumb Rock! " * 8
+        title.setText(original)
+        self.app.processEvents()
+
+        self.assertGreater(title.width(), 350)
+        self.assertGreaterEqual(title.height(), title.fontMetrics().height() + title.fontMetrics().lineSpacing())
+        layout, last_line = title._title_layout(title.width())
+        self.assertEqual(layout.lineCount(), 2)
+        self.assertTrue(last_line.endswith("…"))
+        self.assertEqual(title.text(), original)
+        self.assertIn(original, title.toolTip())
+        self.assertFalse(title.grab().isNull())
+
     def begin_stream(self):
         self.window._append_tracks(self.tracks())
         jobs = []
@@ -414,6 +430,84 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(volume, 35)
         self.assertEqual(entries, [])
 
+    def test_album_play_replaces_queue_and_cancels_older_pending_append(self):
+        old = self.tracks()[0]
+        album_tracks = self.tracks()[1:]
+        self.window._append_tracks([old])
+        self.window.current_id = old.id
+        self.window._play_next_priority.append(old.id)
+        self.window.shuffle_order.record(old.id)
+        jobs = []
+        self.window._submit = lambda fn, done, error=None: jobs.append(done)
+        self.window.resolve_entry(LibraryEntry("Older album", BV, "album"), False)
+
+        album = LibraryEntry("Album", kind="album", tracks=album_tracks, resolved=True)
+        with patch.object(self.window, "_load_stream") as load_stream:
+            self.window.resolve_entry(album, True)
+            queued = self.window._tracks()
+            load_stream.assert_called_once_with(queued[0])
+        self.assertEqual([track.song_id for track in queued], [track.id for track in album_tracks])
+        self.assertEqual(self.window.current_id, queued[0].id)
+        self.assertFalse(self.window._play_next_priority)
+        self.assertEqual(self.window.shuffle_order.history, [queued[0].id])
+        jobs[0](VideoInfo("Older album", "", [old]))
+        self.assertEqual(self.window._tracks(), queued)
+
+    def test_single_play_replaces_queue_and_repeated_append_keeps_one_occurrence(self):
+        old, song, other = self.tracks()
+        self.window._append_tracks([old])
+        entry = LibraryEntry(song.title, song.bvid, page=song.page, tracks=[song], resolved=True)
+
+        with patch.object(self.window, "_load_stream") as load_stream:
+            self.window.resolve_entry(entry, True)
+            queued = self.window._tracks()
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(queued[0].song_id, song.id)
+            self.assertNotEqual(queued[0].id, song.id)
+            self.assertEqual(self.window.current_id, queued[0].id)
+            load_stream.assert_called_once_with(queued[0])
+            self.window._append_tracks([other])
+            self.window.resolve_entry(entry, False)
+            load_stream.assert_called_once()
+
+        self.assertEqual(self.window._tracks(), [queued[0], other])
+        self.assertEqual(self.window.current_id, queued[0].id)
+
+    def test_album_append_skips_existing_songs_and_preserves_album_order(self):
+        first, second, third = self.tracks()
+        # Distinct library entities may refer to the same BV and part.
+        distinct = Track("Separate entity", second.bvid, second.cid, second.page)
+        existing = Track(second.title, second.bvid, second.cid, second.page, song_id=second.id)
+        self.window._append_tracks([existing])
+        self.window.current_id = existing.id
+        album = LibraryEntry("Album", kind="album", tracks=[first, second, distinct, third], resolved=True)
+
+        with patch.object(self.window, "play_item") as play:
+            self.window.resolve_entry(album, False)
+            self.window.resolve_entry(album, False)
+            play.assert_not_called()
+        queued = self.window._tracks()
+        self.assertEqual([track.song_id for track in queued], [second.id, first.id, distinct.id, third.id])
+        self.assertEqual(queued[0].id, existing.id)
+        self.assertEqual(self.window.current_id, existing.id)
+
+    def test_unresolved_album_uses_existing_queue_until_resolution_succeeds(self):
+        first = self.tracks()[0]
+        self.window._append_tracks([first])
+        self.window.current_id = first.id
+        request = self.window._request
+        jobs = []
+        self.window._submit = lambda fn, done, error=None: jobs.append((done, error))
+        album = LibraryEntry("Album", BV, "album")
+
+        with patch.object(self.window, "_error") as error:
+            self.window.resolve_entry(album, True)
+            self.assertEqual(self.window._request, request)
+            jobs[0][1]("Connection failed")
+            error.assert_called_once_with("Connection failed")
+        self.assertEqual(self.window._tracks(), [first])
+        self.assertEqual(self.window.current_id, first.id)
+
     def test_late_append_cannot_undo_clear_queue(self):
         jobs = []
         self.window._submit = lambda fn, done, error=None: jobs.append((fn, done))
@@ -422,15 +516,16 @@ class WindowTests(unittest.TestCase):
         jobs[0][1](VideoInfo("Album", "", self.tracks()))
         self.assertEqual(self.window.queue.count(), 0)
 
-    def test_concurrent_append_requests_both_remain_valid(self):
+    def test_concurrent_album_appends_skip_songs_added_by_the_other_request(self):
         jobs = []
-        self.window._submit = lambda fn, done, error=None: jobs.append((fn, done))
-        entry = LibraryEntry("Album", BV, "album")
-        self.window.resolve_entry(entry, False)
-        self.window.resolve_entry(entry, False)
-        jobs[1][1](VideoInfo("Album", "", [self.tracks()[1]]))
-        jobs[0][1](VideoInfo("Album", "", [self.tracks()[0]]))
-        self.assertEqual(self.window.queue.count(), 2)
+        self.window._submit = lambda fn, done, error=None: jobs.append(done)
+        first, shared, last = self.tracks()
+        self.window.resolve_entry(LibraryEntry("First album", BV, "album"), False)
+        self.window.resolve_entry(LibraryEntry("Second album", BV, "album"), False)
+        jobs[1](VideoInfo("Second album", "", [shared, last]))
+        jobs[0](VideoInfo("First album", "", [first, shared]))
+        self.assertEqual([track.song_id for track in self.window._tracks()],
+                         [shared.id, last.id, first.id])
 
     def test_stale_stream_response_cannot_override_latest_song(self):
         jobs = []

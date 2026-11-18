@@ -238,6 +238,7 @@ class AlbumDialog(_Dialog):
 
     def __init__(self, parent, entry: LibraryEntry, singles: list[LibraryEntry], language=None):
         super().__init__(parent, language)
+        self._owner = getattr(parent, "_owner", parent)
         self.entry = deepcopy(entry)
         self.singles = deepcopy([single for single in singles if single.kind == "single"])
         self._alive = True
@@ -404,7 +405,7 @@ class AlbumDialog(_Dialog):
     def _run(self, fn: Callable, done: Callable):
         if not self._alive:
             return
-        submit = getattr(self.parent(), "_submit", None)
+        submit = getattr(self._owner, "_submit", None)
         if not callable(submit):
             self._show_error(self.tr("当前窗口无法启动后台任务。"))
             return
@@ -503,10 +504,10 @@ class AlbumDialog(_Dialog):
         if len(selected) != 1 or self._pending or not self._alive:
             return
         original = deepcopy(selected[0].data(Qt.ItemDataRole.UserRole))
-        lookup = getattr(self.parent(), "song_for_track", None)
+        lookup = getattr(self._owner, "song_for_track", None)
         song = lookup(original, self.entry) if callable(lookup) else None
         if song is not None:
-            self.parent().edit_single(song)
+            self._owner.edit_single(song)
             if not self._alive:
                 return
             refreshed = lookup(original, self.entry)

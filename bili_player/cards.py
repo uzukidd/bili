@@ -139,6 +139,9 @@ class LibraryCard(QFrame):
         self.play_button.hide()
         self.play_button.installEventFilter(self)
         self.play_button.clicked.connect(lambda: self.playRequested.emit(self.entry_id))
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setInterval(100)
+        self._hover_timer.timeout.connect(self._refresh_hover)
         self.enable_drag(self)
 
     def set_content(self, artwork: CardArtwork, title: str, subtitle: str, play_hint: str):
@@ -203,6 +206,16 @@ class LibraryCard(QFrame):
     def _set_hovered(self, hovered):
         self._hovered = hovered
         self.play_button.setVisible(hovered)
+        if hovered and self.isVisible():
+            if not self._hover_timer.isActive():
+                self._hover_timer.start()
+        else:
+            self._hover_timer.stop()
+
+    def hideEvent(self, event):
+        self._keyboard_focus = False
+        self._set_hovered(False)
+        super().hideEvent(event)
 
     def enterEvent(self, event):
         self._set_hovered(True)
@@ -227,6 +240,8 @@ class LibraryCard(QFrame):
                 self._set_hovered(True)
         if event.type() == QEvent.Type.FocusOut:
             QTimer.singleShot(0, self._refresh_hover)
+        if event.type() == QEvent.Type.MouseMove and not event.buttons() and not self._hovered:
+            self._refresh_hover()
         if watched not in self._drag_widgets:
             return super().eventFilter(watched, event)
         if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
@@ -258,9 +273,18 @@ class LibraryCard(QFrame):
     def _refresh_hover(self):
         if sip.isdeleted(self):
             return
+        if not self.isVisible() or QApplication.activePopupWidget() is not None:
+            self._set_hovered(False)
+            return
+        modal = QApplication.activeModalWidget()
+        if modal is not None and modal is not self.window():
+            self._set_hovered(False)
+            return
         focus = QApplication.focusWidget()
-        has_focus = focus is not None and (focus is self or self.isAncestorOf(focus))
-        self._set_hovered((self._keyboard_focus and has_focus) or self.rect().contains(self.mapFromGlobal(QCursor.pos())))
+        has_focus = focus is self or (focus is not None and self.isAncestorOf(focus))
+        target = QApplication.widgetAt(QCursor.pos())
+        has_pointer = target is self or (target is not None and self.isAncestorOf(target))
+        self._set_hovered(has_pointer or (self._keyboard_focus and has_focus))
 
     def _start_drag(self):
         drag = QDrag(self)

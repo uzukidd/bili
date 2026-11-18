@@ -10,11 +10,13 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QPoint, Qt, QTimer
+from PyQt6.QtGui import QContextMenuEvent
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMenu, QWidget
 
 from bili_player.app import MainWindow
+from bili_player.details import EntryDetailsDialog
 from bili_player.models import LibraryEntry, Track, Store
 
 BV = "BV1xx411c7mD"
@@ -66,13 +68,28 @@ class BatchLibraryTests(unittest.TestCase):
         self.assertEqual(len(self.window._selected_entry_ids), 3)
         self.window.select_library_entry(second.id, Qt.KeyboardModifier.ControlModifier)
         self.assertNotIn(second.id, self.window._selected_entry_ids)
-        self.window.select_all_library()
+        self.window.select_all_button.click()
         self.assertEqual(len(self.window._selected_entry_ids), 3)
+        self.assertFalse(self.window.select_all_button.isEnabled())
         self.window.clear_library_selection()
         self.assertFalse(self.window.batch_copy_button.isEnabled())
         self.assertFalse(self.window.batch_delete_button.isEnabled())
-        self.window.exit_selection_button.click()
+        self.window.search.setFocus()
+        QTest.keyClick(self.window.search, Qt.Key.Key_Escape)
+        self.assertTrue(self.window.isVisible())
+        self.assertFalse(self.window._selection_mode)
         self.assertFalse(self.window.selection_tools.isVisible())
+        self.assertTrue(all(card.selection_box.isHidden() for card in self.window.cards._cards))
+
+    def test_select_all_button_only_selects_filtered_cards(self):
+        first, second = self.populate()
+        second.title = "Other song"
+        self.window.search.setText(first.title)
+        self.window.enter_library_selection(first.id)
+        self.assertFalse(self.window.select_all_button.isEnabled())
+        self.window.clear_library_selection()
+        self.window.select_all_button.click()
+        self.assertEqual(self.window._selected_entry_ids, {first.id})
 
     def test_context_menu_enters_selection_for_songs_and_albums_with_temporary_toolbar(self):
         first, _ = self.populate()
@@ -119,6 +136,74 @@ class BatchLibraryTests(unittest.TestCase):
             QTest.mouseClick(self.window.cards._cards[1].artwork, Qt.MouseButton.LeftButton)
             self.assertEqual(self.window._selected_entry_ids, {first.id, second.id})
             opened.assert_not_called()
+
+    def test_album_row_context_menu_uses_single_actions_and_selects_in_album(self):
+        song, _ = self.populate()
+        album = LibraryEntry("Folder", kind="album", tracks=[song.tracks[0]], resolved=True)
+        self.window.entries.append(album)
+        self.window._normalize_library()
+        dialog = EntryDetailsDialog(self.window, album)
+        dialog.show()
+        self.app.processEvents()
+        title = dialog.track_rows[0].title_label
+        point = QPoint(10, 10)
+        actions = []
+
+        def choose_select(menu, _position):
+            items = {action.data(): action for action in menu.actions() if action.data()}
+            actions.extend(items)
+            items["select"].trigger()
+
+        try:
+            QTest.mouseClick(title, Qt.MouseButton.LeftButton, pos=point)
+            self.assertEqual(dialog.selected_song_ids(), [])
+            with patch.object(QMenu, "exec", choose_select):
+                self.app.sendEvent(title, QContextMenuEvent(QContextMenuEvent.Reason.Mouse, point,
+                                                           title.mapToGlobal(point)))
+            self.assertIn("edit", actions)
+            self.assertIn("details", actions)
+            self.assertIn("add_album", actions)
+            self.assertIn("delete", actions)
+            self.assertEqual(dialog.selected_song_ids(), [song.id])
+            self.assertFalse(self.window._selection_mode)
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+
+    def test_nested_song_details_dim_each_host_and_restore_on_close(self):
+        song, _ = self.populate()
+        album = LibraryEntry("Folder", kind="album", tracks=[song.tracks[0]], resolved=True)
+        self.window.entries.append(album)
+        self.window._normalize_library()
+        snapshots = []
+
+        def check_album():
+            details = QApplication.activeModalWidget()
+            try:
+                main_layer = self.window.findChild(QWidget, "dialogDimLayer", Qt.FindChildOption.FindDirectChildrenOnly)
+                snapshots.append(main_layer is not None and main_layer.isVisible())
+
+                def check_song():
+                    child = QApplication.activeModalWidget()
+                    try:
+                        layer = details.findChild(QWidget, "dialogDimLayer", Qt.FindChildOption.FindDirectChildrenOnly)
+                        snapshots.extend((child.parentWidget() is details,
+                                          layer is not None and layer.isVisible(),
+                                          main_layer.isVisible()))
+                    finally:
+                        child.reject()
+
+                QTimer.singleShot(0, check_song)
+                self.window.open_track_details(album.tracks[0], album)
+                snapshots.append(not any(layer.isVisible() for layer in details.findChildren(QWidget, "dialogDimLayer")))
+                snapshots.append(main_layer.isVisible())
+            finally:
+                details.reject()
+
+        QTimer.singleShot(0, check_album)
+        self.window.open_entry(album)
+        self.assertEqual(snapshots, [True] * 6)
+        self.assertFalse(any(layer.isVisible() for layer in self.window.findChildren(QWidget, "dialogDimLayer")))
 
     def test_same_source_entities_and_edits_stay_independent(self):
         first, second = self.populate()

@@ -232,6 +232,23 @@ class TileTests(unittest.TestCase):
         QApplication.sendEvent(card, QEvent(QEvent.Type.Leave))
         self.assertTrue(card.play_button.isHidden())
 
+    def test_play_buttons_recheck_pointer_when_leave_event_is_missing(self):
+        first, second = self.cards()[:2]
+        self.window.search.setFocus()
+        first._set_hovered(True)
+        second._set_hovered(True)
+        # The old buttons received no leave event. Only the second card is hit now.
+        with patch.object(QApplication, "widgetAt", return_value=second.play_button):
+            QTest.qWait(250)
+            self.assertTrue(first.play_button.isHidden())
+            self.assertFalse(first._hover_timer.isActive())
+            self.assertFalse(second.play_button.isHidden())
+        # The pointer can remain in the card's rectangle while another widget covers it.
+        with patch.object(QApplication, "widgetAt", return_value=self.window.search):
+            QTest.qWait(250)
+            self.assertTrue(second.play_button.isHidden())
+            self.assertFalse(second._hover_timer.isActive())
+
     def test_single_cover_opens_details_without_queueing_or_playing(self):
         card = self.cards()[1]
         with patch.object(self.window, "open_entry") as details, patch.object(self.window, "resolve_entry") as resolve:
