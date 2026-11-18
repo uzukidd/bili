@@ -279,7 +279,7 @@ class MainWindow(QMainWindow):
         self._deferred_album_additions: dict[str, list] = {}
         self.covers = CoverCache(self.store.path.parent / "covers")
         self.pool = QThreadPool.globalInstance()
-        self.proxy = StreamProxy()
+        self.proxy = StreamProxy(self.store.path.parent / "audio-cache")
         self.audio = QAudioOutput(self)
         self.audio.setVolume(volume / 100)
         self.player = QMediaPlayer(self)
@@ -361,6 +361,8 @@ class MainWindow(QMainWindow):
         self._bind(self.language_combo, "语言", "setToolTip")
         self.language_combo.currentIndexChanged.connect(lambda: self.set_language(self.language_combo.currentData()))
         header.addWidget(self.language_combo)
+        self.cache_button = self._button("缓存", self.show_audio_cache_menu)
+        header.addWidget(self.cache_button)
         self.pin_button = self._make_pin_button()
         header.addWidget(self.pin_button)
         self.collapse_button = self._button("折叠", lambda: self.set_mini_mode(True))
@@ -1136,6 +1138,48 @@ class MainWindow(QMainWindow):
 
         self._submit(lambda: self.covers.fetch(source), done, failed)
 
+    def show_audio_cache_menu(self):
+        try:
+            info = self.proxy.cache_info()
+        except OSError as exc:
+            self._error(self.tr("无法读取音频缓存：{message}", message=str(exc)))
+            return
+        menu = QMenu(self)
+        summary = menu.addAction(self.tr("音频缓存：{size} MiB · {count} 首",
+                                         size=f"{info['bytes'] / 1024 ** 2:.1f}", count=info['entries']))
+        summary.setEnabled(False)
+        policy = menu.addAction(self.tr("上限 1 GiB，超限优先清理最久未使用的缓存"))
+        policy.setEnabled(False)
+        menu.addSeparator()
+        clear = menu.addAction(self.tr("清除音频缓存…"), self.clear_audio_cache)
+        clear.setEnabled(self.cache_button.isEnabled())
+        try:
+            menu.exec(self.cache_button.mapToGlobal(self.cache_button.rect().bottomLeft()))
+        finally:
+            menu.deleteLater()
+
+    def clear_audio_cache(self):
+        if not self.cache_button.isEnabled():
+            return
+        answer = QMessageBox.question(
+            self, self.tr("清除音频缓存"),
+            self.tr("清除已下载的音频缓存？音乐库和封面会保留；正在使用的缓存将在切歌或退出后清理。"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.cache_button.setEnabled(False)
+        def done(result):
+            self.cache_button.setEnabled(True)
+            self._status("已清除 {size} MiB 音频缓存 · 待释放 {pending} MiB",
+                         size=f"{result['removed_bytes'] / 1024 ** 2:.1f}",
+                         pending=f"{result['pending_bytes'] / 1024 ** 2:.1f}")
+        def failed(message):
+            self.cache_button.setEnabled(True)
+            self._error(self.tr("清除音频缓存失败：{message}", message=message))
+        self._submit(self.proxy.clear_cache, done, failed)
+
     def show_json_menu(self):
         menu = QMenu(self)
         menu.addAction(self.tr("导入 JSON 曲目…"), self.import_json)
@@ -1649,6 +1693,7 @@ class MainWindow(QMainWindow):
         self._request += 1
         self.player.stop()
         self.player.setSource(QUrl())
+        self.proxy.release_stream()
         self.current_id = track.id
         self._play_next_priority = [identity for identity in self._play_next_priority if identity != track.id]
         self.shuffle_order.record(track.id)
@@ -1669,21 +1714,29 @@ class MainWindow(QMainWindow):
         self._reconnect_attempts = 0
         self._last_progress_at = time.monotonic()
 
+    @staticmethod
+    def _audio_cache_identity(track):
+        return track.song_id or track.id, f"bilibili:{track.bvid}:{track.cid}:{track.page}:best-audio-v1"
+
     def _load_stream(self, track):
         request = self._request
+        cache_key, source_key = self._audio_cache_identity(track)
         self._loading_stream = True
         self._last_progress_at = time.monotonic()
 
-        def done(url):
-            if request != self._request or track.id != self.current_id:
-                return
-            self.player.setSource(QUrl(self.proxy.set_stream(url)))
+        def ready(local_url, cached=False):
+            self.player.setSource(QUrl(local_url))
             self._loading_stream = False
             self._last_progress_at = time.monotonic()
             QTimer.singleShot(0, self._resume_stream)
             if self._want_playing:
                 self.player.play()
-                self._status("正在缓冲音频…")
+                self._status("正在播放缓存音频" if cached else "正在缓冲音频…")
+
+        def done(url):
+            if request != self._request or track.id != self.current_id:
+                return
+            ready(self.proxy.set_stream(url, cache_key=cache_key, source_key=source_key))
 
         def failed(message):
             if request != self._request or track.id != self.current_id:
@@ -1695,6 +1748,13 @@ class MainWindow(QMainWindow):
                 self._want_playing = False
                 self._error(message)
 
+        try:
+            cached_url = self.proxy.get_cached_stream(cache_key, source_key)
+        except OSError:
+            cached_url = None
+        if cached_url is not None:
+            ready(cached_url, cached=True)
+            return
         self._submit(lambda: BilibiliClient().get_stream(track), done, failed)
 
     def _resume_stream(self):
@@ -1794,6 +1854,7 @@ class MainWindow(QMainWindow):
         self._queue_epoch += 1
         self.player.stop()
         self.player.setSource(QUrl())
+        self.proxy.release_stream()
         self.current_id = None
         self.queue.clear()
         self.now_title.setText(self.tr("还没有正在播放的音乐"))
@@ -1832,6 +1893,7 @@ class MainWindow(QMainWindow):
             self._request += 1
             self.player.stop()
             self.player.setSource(QUrl())
+            self.proxy.release_stream()
             self.current_id = None
             if self.queue.count():
                 self.play_item(self.queue.item(min(rows[0], self.queue.count() - 1)))

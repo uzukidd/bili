@@ -4,6 +4,14 @@ from __future__ import annotations
 import re
 
 ENGLISH = {
+    "缓存": "Cache", "清除音频缓存…": "Clear audio cache…", "清除音频缓存": "Clear audio cache",
+    "音频缓存：{size} MiB · {count} 首": "Audio cache: {size} MiB · {count} tracks",
+    "上限 1 GiB，超限优先清理最久未使用的缓存": "1 GiB limit; least recently used audio is cleared first",
+    "清除已下载的音频缓存？音乐库和封面会保留；正在使用的缓存将在切歌或退出后清理。": "Clear downloaded audio? Your library and covers will remain. Audio in use will be cleared after switching tracks or quitting.",
+    "已清除 {size} MiB 音频缓存 · 待释放 {pending} MiB": "Cleared {size} MiB of audio cache · {pending} MiB pending release",
+    "无法读取音频缓存：{message}": "Could not read audio cache: {message}",
+    "清除音频缓存失败：{message}": "Could not clear audio cache: {message}",
+    "正在播放缓存音频": "Playing cached audio",
     "退出多选": "Exit selection", "删除": "Delete",
     "批量导出": "Export selected", "暂未实现": "Not implemented yet",
     "多选": "Select", "批量操作": "Batch actions",
