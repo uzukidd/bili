@@ -1788,7 +1788,8 @@ class MainWindow(QMainWindow):
             return
         if self.player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
             return
-        if time.monotonic() - self._last_progress_at >= 20:
+        last_progress = max(self._last_progress_at, self.proxy.last_progress_time())
+        if time.monotonic() - last_progress >= 20:
             self._recover_stream()
 
     def toggle_play(self):

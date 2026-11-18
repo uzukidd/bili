@@ -22,6 +22,8 @@ class RangeFixture:
         self.data = bytes(range(256)) * (BLOCK_SIZE * 3 // 256) + b'final-block'
         self.seen = []
         self.etag = '"version1"'
+        self.head_etag = True
+        self.get_etag = True
         self.ignore_range = False
         self.truncate = False
         self.bad_range = False
@@ -51,7 +53,8 @@ class RangeFixture:
                 payload = owner.data[start:end + 1]
                 self.send_response(206 if ranged and not owner.ignore_range else 200)
                 self.send_header('Content-Type', 'audio/mp4')
-                self.send_header('ETag', owner.etag)
+                if (head and owner.head_etag) or (not head and owner.get_etag):
+                    self.send_header('ETag', owner.etag)
                 self.send_header('Accept-Ranges', 'bytes')
                 if not owner.unknown_length:
                     self.send_header('Content-Length', str(len(payload)))
@@ -165,6 +168,90 @@ class CachedStreamTests(unittest.TestCase):
                 self.assertEqual(self.proxy.cache_info()['bytes'], 0)
                 setattr(self.fixture, attribute, False)
         self.assertEqual(self.get('bytes=0-99').content, self.fixture.data[:100])
+
+    def test_head_without_etag_then_get_with_etag_does_not_invalidate_first_read(self):
+        self.fixture.head_etag = False
+        head = requests.head(self.url, timeout=3)
+        self.assertEqual(head.status_code, 200)
+        response = self.get('bytes=0-99')
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.content, self.fixture.data[:100])
+
+    def test_missing_etag_on_later_ranges_keeps_valid_blocks(self):
+        self.get('bytes=0-99')
+        self.fixture.get_etag = False
+        response = self.get(f'bytes={BLOCK_SIZE}-{BLOCK_SIZE+99}')
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.content, self.fixture.data[BLOCK_SIZE:BLOCK_SIZE+100])
+        self.assertEqual(self.proxy.cache_info()['bytes'], BLOCK_SIZE * 2)
+
+    def test_slow_full_response_reader_does_not_block_new_seek(self):
+        self.fixture.ignore_range = True
+        self.fixture.data = self.fixture.data * 32
+        stalled = requests.get(self.url, stream=True, timeout=5)
+        try:
+            self.assertEqual(stalled.status_code, 200)
+            start = len(self.fixture.data) - 50
+            before = time.monotonic()
+            result = self.get(f'bytes={start}-')
+            self.assertLess(time.monotonic() - before, 2.5)
+            self.assertEqual(result.status_code, 206)
+            self.assertEqual(result.content, self.fixture.data[start:])
+        finally:
+            stalled.close()
+
+    def test_cached_seek_does_not_wait_for_an_unrelated_network_miss(self):
+        self.get('bytes=0-99')
+        self.fixture.entered.clear()
+        self.fixture.gate = threading.Event()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self.get, f'bytes={BLOCK_SIZE}-{BLOCK_SIZE+99}')
+            try:
+                self.assertTrue(self.fixture.entered.wait(2))
+                before = time.monotonic()
+                self.assertEqual(self.get('bytes=0-99').content, self.fixture.data[:100])
+                self.assertLess(time.monotonic() - before, 1)
+            finally:
+                self.fixture.gate.set()
+            self.assertEqual(future.result(timeout=3).status_code, 206)
+
+    def test_paused_reader_over_three_seconds_does_not_truncate_response(self):
+        self.fixture.ignore_range = True
+        self.fixture.data = self.fixture.data * 32
+        response = requests.get(self.url, stream=True, timeout=5)
+        try:
+            time.sleep(3.4)
+            self.assertEqual(response.content, self.fixture.data)
+        finally:
+            response.close()
+
+    def test_releasing_stream_interrupts_old_read_before_reusing_same_entity(self):
+        self.get('bytes=0-99')
+        self.fixture.entered.clear()
+        self.fixture.gate = threading.Event()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self.get, f'bytes={BLOCK_SIZE}-{BLOCK_SIZE+99}')
+            try:
+                self.assertTrue(self.fixture.entered.wait(2))
+                self.proxy.release_stream()
+                self.url = self.proxy.set_stream(self.fixture.url, cache_key='song1', source_key='bili:1')
+                before = time.monotonic()
+                self.assertEqual(self.get('bytes=0-99').content, self.fixture.data[:100])
+                self.assertLess(time.monotonic() - before, 1)
+            finally:
+                self.fixture.gate.set()
+            self.assertEqual(future.result(timeout=3).status_code, 502)
+
+    def test_range_ignored_body_accepts_arbitrary_network_fragment_sizes(self):
+        self.fixture.ignore_range = True
+        original = requests.Response.iter_content
+        def fragments(response, *args, **kwargs):
+            if response.url == self.fixture.url:
+                yield from original(response, chunk_size=997)
+            else:
+                yield from original(response, *args, **kwargs)
+        with patch.object(requests.Response, 'iter_content', fragments):
+            self.assertEqual(self.get().content, self.fixture.data)
 
     def test_etag_change_never_concatenates_two_representations(self):
         self.get('bytes=0-99')

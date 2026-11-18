@@ -1,10 +1,13 @@
 """Qt-compatible HTTP relay with an optional persistent, entity-scoped block cache."""
 from __future__ import annotations
 
+import logging
 import re
 import secrets
 import socket
 import threading
+import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -13,6 +16,8 @@ import requests
 
 from .api import HEADERS
 from .audio_cache import AudioCache, BLOCK_SIZE, CacheEntry
+
+logger = logging.getLogger(__name__)
 
 
 class UpstreamError(OSError):
@@ -24,6 +29,7 @@ class _Stream:
     url: str
     entry: CacheEntry | None = None
     cancelled: threading.Event = field(default_factory=threading.Event)
+    progress_at: float = 0.0
 
 
 def _range(value: str | None, size: int) -> tuple[int, int, bool]:
@@ -70,7 +76,7 @@ class StreamProxy:
         self._streams: dict[str, _Stream] = {}
         self._closed = threading.Event()
         self._connections: set[socket.socket] = set()
-        self._responses: set[requests.Response] = set()
+        self._responses: dict[requests.Response, _Stream] = {}
         self._cache = (AudioCache(cache_directory, max_cache_bytes, target_cache_bytes)
                        if cache_directory is not None else None)
         owner = self
@@ -100,10 +106,24 @@ class StreamProxy:
             def do_GET(self):
                 self._serve(False)
 
+            def _write(self, stream, data):
+                # A paused decoder may stop draining its socket. Retry short writes
+                # without truncating the declared HTTP body, and remain cancellable.
+                remaining = memoryview(data)
+                while remaining:
+                    owner._check(stream)
+                    try:
+                        sent = self.connection.send(remaining)
+                    except socket.timeout:
+                        continue
+                    if not sent:
+                        raise ConnectionResetError("Audio reader disconnected")
+                    remaining = remaining[sent:]
+
             def _headers(self, status, size, content_type, start=0, end=None, etag=""):
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
-                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Accept-Ranges", "bytes" if size is not None else "none")
                 if size is not None:
                     end = size - 1 if end is None else end
                     self.send_header("Content-Length", str(end - start + 1))
@@ -130,9 +150,7 @@ class StreamProxy:
                         self._relay(stream, head)
                         return
                     entry = stream.entry
-                    # Hold the entry lock across the initial fetch only. Subsequent range
-                    # blocks each acquire it, allowing cached readers between misses.
-                    with entry.download_lock:
+                    with entry.download_lock if entry.size is None else nullcontext():
                         initial = None
                         full = None
                         if entry.size is None:
@@ -141,51 +159,59 @@ class StreamProxy:
                             if entry.size is None:
                                 initial, full = owner._fetch(stream, 0)
                         size = entry.size
-                        if size is None:
-                            if full is None:
-                                raise UpstreamError("Missing upstream audio length")
+                        if size is not None:
                             try:
-                                self._headers(200, None, _content_type(full))
-                                started = True
-                                if not head:
-                                    for data in full.iter_content(64 * 1024):
-                                        owner._check(stream)
-                                        self.wfile.write(data)
-                            finally:
-                                owner._close_response(full)
-                            return
+                                start, end, partial = _range(self.headers.get("Range"), size)
+                            except ValueError:
+                                if full is not None:
+                                    owner._close_response(full)
+                                self.send_response(416)
+                                self.send_header("Content-Range", f"bytes */{size}")
+                                self.send_header("Content-Length", "0")
+                                self.send_header("Connection", "close")
+                                self.end_headers()
+                                return
+                            revision = entry.revision
+                    if size is None:
+                        if full is None:
+                            raise UpstreamError("Missing upstream audio length")
                         try:
-                            start, end, partial = _range(self.headers.get("Range"), size)
-                        except ValueError:
-                            if full is not None:
-                                owner._close_response(full)
-                            self.send_response(416)
-                            self.send_header("Content-Range", f"bytes */{size}")
-                            self.send_header("Content-Length", "0")
-                            self.send_header("Connection", "close")
-                            self.end_headers()
-                            return
-                        revision = entry.revision
-                        if head:
-                            if full is not None:
-                                owner._close_response(full)
-                            self._headers(206 if partial else 200, size, entry.content_type,
-                                          start, end, entry.etag)
-                            return
-                        body = owner._body(stream, start, end, revision, initial, full)
-                        # Buffer at most one block before committing HTTP headers. A
-                        # failed/truncated first download can still become a proper 502.
-                        first = next(body)
+                            self._headers(200, None, _content_type(full))
+                            started = True
+                            if not head:
+                                for data in full.iter_content(64 * 1024):
+                                    owner._check(stream)
+                                    if data:
+                                        stream.progress_at = time.monotonic()
+                                    self._write(stream, data)
+                        finally:
+                            owner._close_response(full)
+                        return
+                    if head:
+                        if full is not None:
+                            owner._close_response(full)
+                        self._headers(206 if partial else 200, size, entry.content_type,
+                                      start, end, entry.etag)
+                        return
+                    body = owner._body(stream, start, end, revision, initial, full)
+                    # Only a verified first block is needed before committing headers.
+                    # No entry lock may cross a generator yield or socket write.
+                    first = next(body)
                     self._headers(206 if partial else 200, size, entry.content_type,
                                   start, end, entry.etag)
                     started = True
-                    self.wfile.write(first)
+                    self._write(stream, first)
                     for data in body:
                         owner._check(stream)
-                        self.wfile.write(data)
+                        self._write(stream, data)
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass
-                except (requests.RequestException, OSError, ValueError, StopIteration):
+                except (requests.RequestException, OSError, ValueError, StopIteration) as exc:
+                    if stream and not stream.cancelled.is_set() and not owner._closed.is_set():
+                        # Do not log signed upstream URLs or response credentials.
+                        detail = str(exc) if isinstance(exc, UpstreamError) else type(exc).__name__
+                        logger.warning("Audio proxy %s failed (%s): %s", self.command,
+                                       "body" if started else "headers", detail)
                     if not started:
                         try:
                             self.send_error(502, "Audio upstream unavailable")
@@ -219,7 +245,8 @@ class StreamProxy:
                         for chunk in response.iter_content(64 * 1024):
                             owner._check(stream)
                             if chunk:
-                                self.wfile.write(chunk)
+                                stream.progress_at = time.monotonic()
+                                self._write(stream, chunk)
                 except (requests.RequestException, OSError):
                     if not started:
                         self.send_error(502, "Audio upstream unavailable")
@@ -251,7 +278,12 @@ class StreamProxy:
                     response.close()
                 else:
                     with self._lock:
-                        self._responses.add(response)
+                        self._responses[response] = stream
+                    if stream.cancelled.is_set() or self._closed.is_set():
+                        self._close_response(response)
+                        self._check(stream)
+                    if response.status_code in (200, 206):
+                        stream.progress_at = time.monotonic()
                     return response
             except requests.RequestException as exc:
                 last = exc
@@ -264,7 +296,7 @@ class StreamProxy:
             response.close()
         finally:
             with self._lock:
-                self._responses.discard(response)
+                self._responses.pop(response, None)
 
     def _head(self, stream):
         response = self._request(stream, "HEAD", {**HEADERS, "Accept-Encoding": "identity"})
@@ -322,8 +354,10 @@ class StreamProxy:
                         or last < first or length != last - first + 1 or length > BLOCK_SIZE):
                     raise UpstreamError("Mismatched audio range")
                 data = bytearray()
-                for part in response.iter_content(BLOCK_SIZE):
+                for part in response.iter_content(64 * 1024):
                     self._check(stream)
+                    if part:
+                        stream.progress_at = time.monotonic()
                     if len(data) + len(part) > length:
                         raise UpstreamError("Oversized audio range")
                     data.extend(part)
@@ -352,21 +386,27 @@ class StreamProxy:
             index = start // BLOCK_SIZE
             while index * BLOCK_SIZE <= end:
                 self._check(stream)
-                with entry.download_lock:
-                    if full is not None:
-                        response, full = full, None
-                        yield from self._full_body(stream, response, max(start, index * BLOCK_SIZE), end, revision)
-                        return
-                    if index == 0 and initial is not None:
-                        data, initial = initial, None
-                    else:
-                        data, full = self._fetch(stream, index)
-                    if entry.revision != revision:
-                        raise UpstreamError("Audio representation changed during playback")
-                    if full is not None:
-                        response, full = full, None
-                        yield from self._full_body(stream, response, max(start, index * BLOCK_SIZE), end, revision)
-                        return
+                data = None
+                if full is None:
+                    data = self._cache.read_block(entry, index)
+                    if data is None:
+                        with entry.download_lock:
+                            if index == 0 and initial is not None:
+                                data, initial = initial, None
+                            else:
+                                data, full = self._fetch(stream, index)
+                if entry.revision != revision:
+                    raise UpstreamError("Audio representation changed during playback")
+                if full is not None:
+                    # Never keep the entry lock while yielding to a socket: FFmpeg
+                    # opens a seek connection before closing/draining the old one.
+                    response = full
+                    # Let the handler send validated headers before scanning a
+                    # Range-ignored response's prefix for a distant seek.
+                    yield b""
+                    full = None
+                    yield from self._full_body(stream, response, max(start, index * BLOCK_SIZE), end, revision)
+                    return
                 left = max(start - index * BLOCK_SIZE, 0)
                 right = min(end - index * BLOCK_SIZE + 1, len(data))
                 if right <= left:
@@ -382,22 +422,33 @@ class StreamProxy:
         entry = stream.entry
         position = 0
         try:
-            for data in response.iter_content(BLOCK_SIZE):
+            buffered = bytearray()
+            for part in response.iter_content(64 * 1024):
                 self._check(stream)
+                if part:
+                    stream.progress_at = time.monotonic()
+                buffered.extend(part)
                 if entry.revision != revision:
                     raise UpstreamError("Audio representation changed during playback")
-                expected = min(BLOCK_SIZE, entry.size - position)
-                if not data or len(data) != expected or position >= entry.size:
-                    raise UpstreamError("Truncated or oversized full audio response")
-                if position == 0:
-                    _audio_bytes(data)
-                self._cache.write_block(entry, position // BLOCK_SIZE, data)
-                left, right = max(start - position, 0), min(end - position + 1, len(data))
-                if right > left:
-                    yield data[left:right]
-                position += len(data)
-                if position > end:
-                    return
+                if position + len(buffered) > entry.size:
+                    raise UpstreamError("Oversized full audio response")
+                while buffered and len(buffered) >= min(BLOCK_SIZE, entry.size - position):
+                    expected = min(BLOCK_SIZE, entry.size - position)
+                    if expected <= 0:
+                        raise UpstreamError("Oversized full audio response")
+                    data = bytes(buffered[:expected])
+                    del buffered[:expected]
+                    if position == 0:
+                        _audio_bytes(data)
+                    self._cache.write_block(entry, position // BLOCK_SIZE, data, revision=revision)
+                    if entry.revision != revision:
+                        raise UpstreamError("Audio representation changed during playback")
+                    left, right = max(start - position, 0), min(end - position + 1, len(data))
+                    position += len(data)
+                    if right > left:
+                        yield data[left:right]
+                    if position > end:
+                        return
             if position <= end:
                 raise UpstreamError("Truncated full audio response")
         finally:
@@ -437,8 +488,15 @@ class StreamProxy:
             streams, self._streams = self._streams, {}
             for stream in streams.values():
                 stream.cancelled.set()
+                for response, owner in list(self._responses.items()):
+                    if owner is stream:
+                        self._interrupt_response(response)
                 if stream.entry:
                     self._cache.deactivate(stream.entry)
+
+    def last_progress_time(self) -> float:
+        with self._lock:
+            return max((stream.progress_at for stream in self._streams.values()), default=0.0)
 
     def cache_info(self) -> dict:
         return self._cache.info() if self._cache else {"bytes": 0, "entries": 0, "pending_bytes": 0}
@@ -462,11 +520,15 @@ class StreamProxy:
         # Interrupt in-flight upstream reads without waiting for a response's buffered
         # reader lock. Handlers own response.close() and release their cache leases.
         for response in responses:
-            try:
-                upstream = response.raw._fp.fp.raw._sock
-                upstream.shutdown(socket.SHUT_RDWR)
-            except (AttributeError, OSError):
-                pass
+            self._interrupt_response(response)
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=1)
+
+    @staticmethod
+    def _interrupt_response(response):
+        try:
+            upstream = response.raw._fp.fp.raw._sock
+            upstream.shutdown(socket.SHUT_RDWR)
+        except (AttributeError, OSError):
+            pass

@@ -181,6 +181,16 @@ class WindowTests(unittest.TestCase):
         self.window._check_playback_progress()
         self.assertEqual(len(jobs), 2)
 
+    def test_watchdog_does_not_interrupt_active_download_without_position_changes(self):
+        jobs = self.begin_stream()
+        self.window._last_progress_at = time.monotonic() - 30
+        with patch.object(self.window.proxy, "last_progress_time", return_value=time.monotonic()):
+            self.window._check_playback_progress()
+            self.assertEqual(len(jobs), 1)
+        with patch.object(self.window.proxy, "last_progress_time", return_value=time.monotonic() - 30):
+            self.window._check_playback_progress()
+            self.assertEqual(len(jobs), 2)
+
     def test_reconnect_stops_after_three_failures_and_can_be_retried(self):
         jobs = self.begin_stream()
         self.window._recover_stream()

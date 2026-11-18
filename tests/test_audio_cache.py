@@ -50,6 +50,15 @@ class AudioCacheTests(unittest.TestCase):
         self.assertIsNone(restarted.read_block(loaded, 0))
         self.assertFalse(loaded.complete)
 
+    def test_old_response_cannot_commit_blocks_after_representation_changes(self):
+        entry = self.entry(length=BLOCK_SIZE)
+        revision = entry.revision
+        self.cache.representation(entry, BLOCK_SIZE, "audio/mp4", '"v2"')
+        self.assertFalse(self.cache.write_block(entry, 0, b"a" * BLOCK_SIZE, revision=revision))
+        self.assertIsNone(self.cache.read_block(entry, 0))
+        self.assertTrue(self.cache.write_block(entry, 0, b"b" * BLOCK_SIZE, revision=entry.revision))
+        self.assertEqual(self.cache.read_block(entry, 0), b"b" * BLOCK_SIZE)
+
     def test_distinct_entities_same_source_are_independent(self):
         first = self.entry("first", length=BLOCK_SIZE)
         second = self.entry("second", length=BLOCK_SIZE)

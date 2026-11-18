@@ -275,7 +275,7 @@ class AudioCache:
     def representation(self, entry, size: int, content_type: str, etag: str):
         with self._lock:
             changed = entry.size is not None and (
-                entry.size != size or entry.etag != etag
+                entry.size != size or bool(entry.etag and etag and entry.etag != etag)
             )
             if changed:
                 entry.revision += 1
@@ -285,7 +285,9 @@ class AudioCache:
                         path.unlink(missing_ok=True)
                 except OSError:
                     entry.writable = False
-            entry.size, entry.content_type, entry.etag = size, content_type, etag
+            entry.size, entry.content_type = size, content_type
+            if etag or changed:
+                entry.etag = etag
             self._save(entry)
 
     def read_block(self, entry, index: int) -> bytes | None:
@@ -309,8 +311,10 @@ class AudioCache:
             self._save(entry)
             return None
 
-    def write_block(self, entry, index: int, data: bytes) -> bool:
+    def write_block(self, entry, index: int, data: bytes, *, revision: int | None = None) -> bool:
         with self._lock:
+            if revision is not None and entry.revision != revision:
+                return False
             if (entry.pending or not entry.writable or entry.size is None or index < 0
                     or len(data) != min(BLOCK_SIZE, entry.size - index * BLOCK_SIZE) or not data):
                 return False
