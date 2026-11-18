@@ -207,7 +207,7 @@ class _SinglesDialog(_Dialog):
         self.setWindowTitle(self.tr("添加已有单曲"))
         self.setMinimumSize(440, 340)
         layout = QVBoxLayout(self)
-        hint = self._label(self.tr("勾选要复制到专辑的单曲，原单曲会保留。"), "muted")
+        hint = self._label(self.tr("勾选要添加到专辑的单曲，同一首歌曲的修改会同步到所有专辑。"), "muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
         self.singles_list = QListWidget()
@@ -268,6 +268,14 @@ class AlbumDialog(_Dialog):
         self.count_label = self._label(name="muted")
         toolbar.addWidget(self.count_label)
         layout.addLayout(toolbar)
+        selection = QHBoxLayout()
+        self.select_all_button = self._button("全选", lambda: self.tracks_list.selectAll())
+        self.clear_selection_button = self._button("清除选择", lambda: self.tracks_list.clearSelection())
+        self.selection_label = self._label(name="muted")
+        for widget in (self.select_all_button, self.clear_selection_button, self.selection_label):
+            selection.addWidget(widget)
+        selection.addStretch()
+        layout.addLayout(selection)
         self.tracks_list = QListWidget()
         self.tracks_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tracks_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
@@ -315,6 +323,9 @@ class AlbumDialog(_Dialog):
         selected = self.tracks_list.selectedItems()
         rows = sorted(self.tracks_list.row(item) for item in selected)
         self.count_label.setText(self.tr("{count} 首曲目", count=count))
+        self.selection_label.setText(self.tr("已选择 {count} 首", count=len(selected)))
+        self.select_all_button.setEnabled(count > len(selected))
+        self.clear_selection_button.setEnabled(bool(selected))
         self.edit_button.setEnabled(len(selected) == 1 and self._pending == 0)
         self.remove_button.setEnabled(bool(selected))
         self.up_button.setEnabled(bool(rows) and rows[0] > 0)
@@ -344,16 +355,13 @@ class AlbumDialog(_Dialog):
     def add_tracks(self, tracks: list[Track]):
         if not self._alive:
             return
-        existing = self._tracks()
-        identities = {track.id for track in existing}
-        sources = {(track.bvid, track.page) for track in existing}
+        identities = {track.song_id or track.id for track in self._tracks()}
         for track in tracks:
-            source = (track.bvid, track.page)
-            if track.id in identities or source in sources:
+            identity = track.song_id or track.id
+            if identity in identities:
                 continue
             self._append_track(deepcopy(track))
-            identities.add(track.id)
-            sources.add(source)
+            identities.add(identity)
         self._update_controls()
 
     def remove_selected(self, *_):
@@ -458,7 +466,7 @@ class AlbumDialog(_Dialog):
 
         def load():
             info = BilibiliClient().get_video(source)
-            tracks = [replace(track, id=str(uuid4())) for track in info.tracks]
+            tracks = [replace(track, id=str(uuid4()), song_id="") for track in info.tracks]
             return self._single_title(source, tracks), info.cover
 
         def added(result):
@@ -481,9 +489,10 @@ class AlbumDialog(_Dialog):
             tracks = []
             for entry in selected:
                 if entry.tracks:
-                    resolved = deepcopy(entry.tracks)
+                    resolved = [replace(deepcopy(track), song_id=entry.id) for track in entry.tracks]
                 else:
-                    resolved = [replace(track, id=entry.id) for track in BilibiliClient().get_tracks(entry)]
+                    resolved = [replace(track, id=entry.id, song_id=entry.id)
+                                for track in BilibiliClient().get_tracks(entry)]
                 tracks.extend(self._single_title(entry, resolved))
             return tracks
 
@@ -503,9 +512,10 @@ class AlbumDialog(_Dialog):
             refreshed = lookup(original, self.entry)
             for row in range(self.tracks_list.count()):
                 item = self.tracks_list.item(row)
-                if item.data(Qt.ItemDataRole.UserRole).id == original.id:
+                member = item.data(Qt.ItemDataRole.UserRole)
+                if (member.song_id or member.id) == (original.song_id or original.id):
                     if refreshed is not None and refreshed.tracks:
-                        self._format_item(item, deepcopy(refreshed.tracks[0]))
+                        self._format_item(item, replace(deepcopy(refreshed.tracks[0]), song_id=refreshed.id))
                     else:
                         self.tracks_list.takeItem(row)
                     break
@@ -520,7 +530,8 @@ class AlbumDialog(_Dialog):
             # The user may remove or reorder this track while the API is working.
             for row in range(self.tracks_list.count()):
                 item = self.tracks_list.item(row)
-                if item.data(Qt.ItemDataRole.UserRole).id == original.id:
+                member = item.data(Qt.ItemDataRole.UserRole)
+                if (member.song_id or member.id) == (original.song_id or original.id):
                     self._format_item(item, track)
                     break
 
@@ -537,7 +548,7 @@ class AlbumDialog(_Dialog):
                 raise ValueError(self.tr("这个视频没有可播放的分 P。"))
             return replace(
                 deepcopy(tracks[0]), id=original.id, title=edited.title, artist=edited.artist,
-                date=edited.date,
+                date=edited.date, song_id=original.song_id,
             )
 
         self._run(load, apply)

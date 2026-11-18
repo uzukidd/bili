@@ -7,13 +7,12 @@ from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlsplit
-from uuid import uuid4
 
 from .models import LibraryEntry, Track
 
 
 _FORMAT = "bili-music-library"
-_VERSION = 2
+_VERSION = 3
 _MAX_FILE_BYTES = 16 * 1024 * 1024
 
 
@@ -86,7 +85,7 @@ def dumps_library(entries: list[LibraryEntry]) -> str:
 
 
 def loads_library(text: str) -> list[LibraryEntry]:
-    """Validate the graph, then renew IDs / 完整验证图结构后重新生成 ID。"""
+    """Validate and load an ID-preserving graph / 验证并载入保留 ID 的图结构。"""
     from .catalog import decode_library, normalize_library
 
     if not isinstance(text, str):
@@ -103,11 +102,11 @@ def loads_library(text: str) -> list[LibraryEntry]:
     if "format" in payload:
         if payload["format"] != _FORMAT:
             raise ValueError("不支持的音乐库格式")
-        if version not in (1, _VERSION):
+        if version not in (1, 2, _VERSION):
             raise ValueError("不支持的音乐库版本")
-        # Portable v1 is nested; portable v2 uses the Store v3 graph schema.
-        version = 3 if version == _VERSION else 1
-    elif version not in (1, 2, 3):
+        # Portable versions 1/2/3 use nested / Store v3 / Store v4 schemas.
+        version = {1: 1, 2: 3, 3: 4}[version]
+    elif version not in (1, 2, 3, 4):
         raise ValueError("不支持的音乐库版本")
     if not isinstance(payload.get("entries"), list):
         raise ValueError("音乐库 entries 必须是列表")
@@ -115,21 +114,14 @@ def loads_library(text: str) -> list[LibraryEntry]:
     if "songs" in payload:
         library["songs"] = payload["songs"]
     # Queue, volume and settings from Store snapshots are deliberately excluded.
-    # Decode the entire graph before assigning IDs, including all references.
+    # Decode the entire graph before returning it, including all references.
     try:
         entries = decode_library(library)
     except (TypeError, KeyError) as exc:
         raise ValueError("音乐库条目或曲目的字段不正确，请检查必填字段和额外字段") from exc
     for entry in entries:
-        entry.id = str(uuid4())
         entry.cover = _cover_url(entry.cover)
-        if entry.kind == "single":
-            for track in entry.tracks:
-                # Albums already hold this exact object after decoding. Updating
-                # it renews every folder reference without copying the song.
-                track.id = entry.id
-                track.song_id = entry.id
-        elif entry.bvid == "":
+        if entry.kind == "album" and entry.bvid == "":
             entry.resolved = True
     normalize_library(entries)
     return entries

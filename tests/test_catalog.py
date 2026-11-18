@@ -30,7 +30,7 @@ def album(title, tracks=(), **kwargs):
 class CatalogTests(unittest.TestCase):
     def test_two_albums_share_the_exact_canonical_single_track(self):
         first_track = song("首个标题", identifier="first-copy", artist="手填作者")
-        second_track = song("冲突旧标题", identifier="second-copy", date="手填日期")
+        second_track = song("冲突旧标题", identifier="second-copy", song_id="first-copy", date="手填日期")
         first = album("专辑甲", [first_track, first_track])
         second = album("专辑乙", [second_track])
         entries = [first, second]
@@ -52,8 +52,8 @@ class CatalogTests(unittest.TestCase):
         self.assertIs(find_song(entries, "second-copy"), canonical)
         self.assertIs(normalize_library(entries)[2], canonical)
 
-    def test_explicit_single_wins_even_after_albums_and_keeps_stable_entry_id(self):
-        embedded = song("专辑旧标题", artist="旧作者", duration=80, date="旧日期")
+    def test_explicit_single_wins_for_its_id_even_after_album_and_keeps_other_singles(self):
+        embedded = song("专辑旧标题", song_id="single-entry", artist="旧作者", duration=80, date="旧日期")
         preferred = song("单曲缓存标题", identifier="single-track", artist="缓存作者")
         single = LibraryEntry("单曲手填名", BVID, id="single-entry", tracks=[preferred],
                               artist="手填作者", date="手填日期", cover="custom-cover")
@@ -62,29 +62,30 @@ class CatalogTests(unittest.TestCase):
         folder = album("专辑", [embedded])
         entries = [folder, single, duplicate]
         normalize_library(entries)
-        self.assertEqual(entries, [folder, single])
+        self.assertEqual(entries, [folder, single, duplicate])
         self.assertIs(single.tracks[0], preferred)
         self.assertIs(folder.tracks[0], preferred)
-        self.assertEqual((single.id, preferred.id, preferred.song_id),
-                         ("single-entry",) * 3)
+        self.assertIsNot(duplicate.tracks[0], preferred)
+        self.assertEqual((single.id, preferred.id, preferred.song_id), ("single-entry",) * 3)
         self.assertEqual((preferred.title, preferred.artist, preferred.date, preferred.duration),
                          ("单曲手填名", "手填作者", "手填日期", 80))
         self.assertEqual(single.cover, "custom-cover")
-        for old_id in ("old-track", "single-track", "duplicate-entry", "duplicate-track"):
+        for old_id in ("old-track", "single-track"):
             self.assertIs(find_song(entries, old_id), single)
+        self.assertIs(find_song(entries, "duplicate-entry"), duplicate)
 
-    def test_nonempty_fallback_prefers_earlier_single_cache_over_later_copies(self):
+    def test_metadata_fallback_does_not_merge_same_source_singles(self):
         first = LibraryEntry("", BVID, tracks=[song("缓存手填", artist="缓存作者")])
         second = LibraryEntry("后备标题", BVID, tracks=[song("后备缓存", identifier="later")],
                               artist="后备作者", date="后备日期", cover="saved-cover")
         entries = [first, second]
         normalize_library(entries)
-        self.assertEqual(entries, [first])
+        self.assertEqual(entries, [first, second])
         self.assertEqual((first.title, first.artist, first.date, first.cover),
-                         ("缓存手填", "缓存作者", "后备日期", "saved-cover"))
+                         ("缓存手填", "缓存作者", "", ""))
 
     def test_editing_canonical_track_is_visible_in_every_album(self):
-        entries = [album("甲", [song()]), album("乙", [song(identifier="copy")])]
+        entries = [album("甲", [song()]), album("乙", [song(identifier="copy", song_id="old-track")])]
         normalize_library(entries)
         canonical = entries[-1]
         canonical.tracks[0].title = "编辑曲名"
@@ -106,7 +107,7 @@ class CatalogTests(unittest.TestCase):
         second_page = song(page=2, identifier="page-two")
         first = album("甲", [second_page, first_page, second_page])
         empty = album("有 BV 的空专辑")
-        last = album("乙", [song(identifier="another-copy")])
+        last = album("乙", [song(identifier="another-copy", song_id="page-one")])
         entries = [first, empty, last]
         normalize_library(entries)
         self.assertEqual(entries[:3], [first, empty, last])
@@ -146,10 +147,10 @@ class CatalogTests(unittest.TestCase):
 
     def test_delete_song_removes_every_membership_but_preserves_folders_and_other_music(self):
         first = album("甲", [song(), song(page=2, identifier="other")])
-        second = album("乙", [song(identifier="legacy-alias")])
+        second = album("乙", [song(identifier="legacy-alias", song_id="old-track")])
         entries = [first, second]
         normalize_library(entries)
-        self.assertIs(delete_song(entries, "legacy-alias"), entries)
+        self.assertIs(delete_song(entries, "old-track"), entries)
         self.assertEqual([entry.kind for entry in entries], ["album", "album", "single"])
         self.assertEqual([track.page for track in first.tracks], [2])
         self.assertEqual(second.tracks, [])
@@ -161,10 +162,10 @@ class CatalogTests(unittest.TestCase):
     def test_merge_preserves_existing_metadata_even_for_album_only_song(self):
         existing_folder = album("原文件夹", [song("现有手填名", artist="现有作者")], id="existing-folder")
         existing = [existing_folder]
-        incoming_single = LibraryEntry("导入新名称", BVID, id="imported-song",
+        incoming_single = LibraryEntry("导入新名称", BVID, id="old-track",
                                        tracks=[song("导入缓存", identifier="imported-track")],
                                        artist="导入作者", date="后备日期")
-        incoming_folder = album("新文件夹", [song("导入专辑副本", identifier="imported-copy"),
+        incoming_folder = album("新文件夹", [song("导入专辑副本", identifier="imported-copy", song_id="old-track"),
                                             song(page=2, identifier="new-source")], id="new-folder")
         self.assertIs(merge_libraries(existing, [incoming_single, incoming_folder]), existing)
         self.assertEqual([entry.title for entry in existing[:3]], ["原文件夹", "现有手填名", "新文件夹"])
@@ -177,11 +178,11 @@ class CatalogTests(unittest.TestCase):
         merge_libraries(existing, [incoming_folder])
         self.assertEqual(len(existing), 4)
 
-    def test_v3_references_roundtrip_and_contain_no_album_metadata_copies(self):
-        entries = [album("甲", [song()]), album("乙", [song(identifier="copy")]),
+    def test_v4_references_roundtrip_and_contain_no_album_metadata_copies(self):
+        entries = [album("甲", [song()]), album("乙", [song(identifier="copy", song_id="old-track")]),
                    LibraryEntry("待解析", OTHER_BVID, id="pending")]
         payload = encode_library(entries)
-        self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["version"], 4)
         for item in payload["entries"][:2]:
             self.assertNotIn("tracks", item)
             self.assertEqual(item["song_ids"], [entries[-1].id])
@@ -191,7 +192,7 @@ class CatalogTests(unittest.TestCase):
         self.assertIs(loaded[0].tracks[0], loaded[-1].tracks[0])
         self.assertFalse(loaded[2].resolved)
 
-    def test_v3_rejects_missing_references_duplicate_ids_and_corrupt_shapes(self):
+    def test_graph_rejects_missing_references_duplicate_ids_and_corrupt_shapes(self):
         payload = encode_library([album("甲", [song()])])
         invalid = []
         changed = copy.deepcopy(payload)
@@ -222,6 +223,7 @@ class CatalogTests(unittest.TestCase):
         duplicate = copy.deepcopy(changed["entries"][1])
         duplicate["id"] = duplicate["tracks"][0]["id"] = duplicate["tracks"][0]["song_id"] = "different-id"
         changed["entries"].append(duplicate)
+        changed["version"] = 3  # Only the older schema forbids equal sources.
         invalid.append(changed)
         for changed in invalid:
             with self.subTest(payload=changed), self.assertRaises(ValueError):
@@ -277,7 +279,7 @@ class CatalogStoreTests(unittest.TestCase):
         self.path.write_bytes(original)
         return original
 
-    def test_v1_v2_migrate_in_memory_then_backup_exact_bytes_once_before_v3_save(self):
+    def test_v1_v2_migrate_in_memory_then_backup_exact_bytes_once_before_v4_save(self):
         for version in (1, 2):
             with self.subTest(version=version):
                 original = self.legacy(version)
@@ -294,7 +296,7 @@ class CatalogStoreTests(unittest.TestCase):
                 self.store.save(entries, queue, volume)
                 self.assertEqual(backup.read_bytes(), original)
                 payload = json.loads(self.path.read_bytes())
-                self.assertEqual(payload["version"], 3)
+                self.assertEqual(payload["version"], 4)
                 self.assertEqual(payload["entries"][0]["song_ids"], ["legacy-single"])
                 self.assertNotIn("tracks", payload["entries"][0])
                 reloaded = self.store.load()
@@ -317,8 +319,8 @@ class CatalogStoreTests(unittest.TestCase):
         entries = [album("专辑", [song()])]
         normalize_library(entries)
         canonical = entries[1]
-        queue = [replace(canonical.tracks[0], id="first-occurrence", song_id=""),
-                 replace(canonical.tracks[0], id="second-occurrence", song_id="")]
+        queue = [replace(canonical.tracks[0], id="first-occurrence", song_id=canonical.id),
+                 replace(canonical.tracks[0], id="second-occurrence", song_id=canonical.id)]
         self.store.save(entries, queue, 40)
         loaded_entries, loaded_queue, _ = self.store.load()
         self.assertEqual([track.id for track in loaded_queue], ["first-occurrence", "second-occurrence"])
@@ -351,7 +353,7 @@ class CatalogStoreTests(unittest.TestCase):
                 self.assertEqual(self.path.with_name(self.path.name + f".v{version}.bak").read_bytes(), original)
                 self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
 
-    def test_corrupt_v3_cannot_be_overwritten(self):
+    def test_corrupt_v4_cannot_be_overwritten(self):
         payload = encode_library([album("专辑", [song()])])
         payload.update(tracks=[], volume=50)
         payload["entries"][0]["song_ids"] = ["missing"]

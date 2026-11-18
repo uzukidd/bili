@@ -32,7 +32,9 @@ QFrame#queuePanel, QFrame#player, QFrame#queueOverlay { background: PANEL; borde
     border-radius: 14px; }
 QFrame#card { background: transparent; border: 1px solid transparent; border-radius: 9px; }
 QFrame#card:hover { background: PANEL; }
-QFrame#card[dropTarget="true"] { background: SOFT; border-color: ACCENT; }
+QFrame#card[dropTarget="true"], QFrame#card[selected="true"] { background: SOFT; border-color: ACCENT; }
+QCheckBox { spacing: 4px; }
+QCheckBox::indicator { width: 18px; height: 18px; }
 QPushButton#cardArtwork, QPushButton#hoverPlay { border: none; background: transparent; padding: 0; }
 QPushButton[flatIcon="true"] { border: none; background: transparent; padding: 4px; }
 QPushButton[flatIcon="true"]:hover, QPushButton[flatIcon="true"]:checked {

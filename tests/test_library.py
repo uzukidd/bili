@@ -67,6 +67,7 @@ class LibraryTests(unittest.TestCase):
         occurrence = replace(track, id="queue-occurrence")
         single = LibraryEntry("手填单曲名", BVID, tracks=[track], resolved=True,
                               artist="单曲作者", date="单曲日期")
+        occurrence.song_id = single.id
         album = LibraryEntry("手填专辑名", BVID, "album", tracks=[track], resolved=True,
                              artist="专辑作者", date="专辑日期")
         self.store.save([single, album], [occurrence], 60)
@@ -78,7 +79,7 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual((entries[0].tracks[0].artist, entries[0].tracks[0].date),
                          ("单曲作者", "单曲日期"))
         data = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(data["version"], 3)
+        self.assertEqual(data["version"], 4)
         expected_album = asdict(album)
         expected_album.pop("tracks")
         expected_album["song_ids"] = [single.id]
@@ -118,7 +119,7 @@ class LibraryTests(unittest.TestCase):
                     self.store.save(entries, queue, volume)
                     self.assertEqual(self.store.load(), (entries, queue, volume))
 
-    def test_v1_load_does_not_write_and_first_v3_save_backs_up_exact_bytes(self):
+    def test_v1_load_does_not_write_and_first_v4_save_backs_up_exact_bytes(self):
         original = self.legacy_bytes()
         self.path.write_bytes(original)
         entries, queue, volume = self.store.load()
@@ -133,7 +134,7 @@ class LibraryTests(unittest.TestCase):
         self.store.save(entries, queue, volume, {"theme": "dark", "language": "en_US"})
         self.assertEqual(backup.read_bytes(), original)
         data = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(data["version"], 3)
+        self.assertEqual(data["version"], 4)
         self.assertFalse(data["entries"][0]["resolved"])
         self.store.save([], [], 50)
         self.assertEqual(backup.read_bytes(), original)
@@ -254,6 +255,7 @@ class LibraryTests(unittest.TestCase):
         album = LibraryEntry("我的专辑", BVID, "album", tracks=[first, second],
                              cover="https://image.test/cover.jpg", resolved=True)
         single = LibraryEntry("缓存单曲", OTHER_BVID, tracks=[first], resolved=True)
+        occurrence.song_id = single.id
         original_entries = [album, single]
         self.store.save(original_entries, [occurrence], 60)
         entries, queue, volume = self.store.load()
@@ -355,7 +357,7 @@ class LibraryTests(unittest.TestCase):
             self.assertEqual(self.path.read_bytes(), original)
 
     def test_unsupported_and_boolean_versions_are_rejected(self):
-        for version in (0, 4, True, "2"):
+        for version in (0, 5, True, "2"):
             with self.subTest(version=version):
                 original = self.write_data(version=version)
                 with self.assertRaises(ValueError):

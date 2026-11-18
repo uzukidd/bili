@@ -136,7 +136,30 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual([t.page for t in album.tracks], [1, 2, 3])
         self.assertEqual([t.id for t in self.window._tracks()], queue_ids)
         self.assertEqual([t.id for t in restored_queue], queue_ids)
-        self.assertEqual(self.window._tracks()[0].title, "Edited imported song")
+        # A pre-existing unlinked queue snapshot with the same source is independent.
+        self.assertEqual(self.window._tracks()[0].title, "P1")
+
+    def test_list_song_video_covers_survive_save_and_same_source_stays_independent(self):
+        tracks = self.tracks()
+        existing = LibraryEntry("Existing", BV, page=1, tracks=[deepcopy(tracks[0])],
+                                cover="https://example.test/custom.jpg", resolved=True)
+        self.window.entries.append(existing)
+        album = LibraryEntry("List", kind="album", tracks=tracks,
+                             cover="https://example.test/list.jpg", resolved=True)
+        songs = [LibraryEntry(t.title, t.bvid, page=t.page, tracks=[t],
+                              cover=f"https://example.test/video-{t.page}.jpg", resolved=True)
+                 for t in tracks]
+        self.window.commit_list_import(ListImportResult(album, [], 3, songs))
+        self.assertEqual(self.window.song_for_track(tracks[0]).cover, songs[0].cover)
+        self.assertEqual(existing.cover, "https://example.test/custom.jpg")
+        self.assertNotEqual(existing.id, songs[0].id)
+        self.assertEqual(self.window.song_for_track(tracks[1]).cover, songs[1].cover)
+        restored, _, _ = Store(self.path).load()
+        saved_songs = {e.id: e for e in restored if e.kind == "single"}
+        self.assertEqual(saved_songs[existing.id].cover, "https://example.test/custom.jpg")
+        self.assertEqual(saved_songs[songs[0].id].cover, "https://example.test/video-1.jpg")
+        self.assertEqual(saved_songs[songs[1].id].cover, "https://example.test/video-2.jpg")
+        self.assertEqual(next(e for e in restored if e.kind == "album").cover, album.cover)
 
     def test_cancelled_list_dialog_does_not_create_album(self):
         with patch("bili_player.app.ListImportDialog") as dialog:

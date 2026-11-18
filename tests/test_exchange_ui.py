@@ -69,15 +69,15 @@ class PlayerIntegrationTests(unittest.TestCase):
         self.assertEqual(imported[1].cover, "")
         self.assertEqual(original[1].cover, "C:/external/cover.png")
         payload = json.loads(destination.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["version"], 3)
         self.assertEqual([e["id"] for e in payload["entries"]], [e.id for e in original])
         self.assertEqual(payload["entries"][0]["song_ids"], [original[2].id])
         self.assertNotIn("tracks", payload["entries"][0])
-        self.assertTrue(set(e.id for e in imported).isdisjoint(e.id for e in original))
+        self.assertEqual([e.id for e in imported], [e.id for e in original])
         self.assertNotIn("Queue only", destination.read_text(encoding="utf-8"))
         self.assertNotIn("settings", destination.read_text(encoding="utf-8"))
 
-    def test_import_appends_all_entries_without_playback_and_persists_new_ids(self):
+    def test_import_appends_all_entries_without_playback_and_persists_ids(self):
         incoming = self.entries()
         destination = self.root / "incoming.json"
         write_library(destination, incoming)
@@ -93,9 +93,9 @@ class PlayerIntegrationTests(unittest.TestCase):
             source.assert_not_called()
         self.assertEqual([e.title for e in self.window.entries], ["Keep me", "Album", "Single", "Song A"])
         self.assertEqual(self.window.entries[0].id, existing.id)
-        self.assertNotEqual(self.window.entries[1].id, incoming[0].id)
-        self.assertNotEqual(self.window.entries[1].tracks[0].id, incoming[0].tracks[0].id)
-        self.assertTrue(set(e.id for e in self.window.entries[1:]).isdisjoint(e.id for e in incoming))
+        self.assertEqual(self.window.entries[1].id, incoming[0].id)
+        self.assertEqual(self.window.entries[1].tracks[0].id, incoming[0].tracks[0].id)
+        self.assertEqual([e.id for e in self.window.entries[1:3]], [e.id for e in incoming])
         self.assertIs(self.window.entries[1].tracks[0], self.window.entries[3].tracks[0])
         self.assertEqual(self.window.entries[1].tracks[0].song_id, self.window.entries[3].id)
         self.assertEqual(self.window.current_id, queued.id)
@@ -115,7 +115,9 @@ class PlayerIntegrationTests(unittest.TestCase):
         self.window.current_id = occurrence.id
         request = self.window._request
         destination = self.root / "incoming.json"
-        write_library(destination, self.entries())
+        incoming = self.entries()
+        incoming[0].tracks[0].song_id = existing.id
+        write_library(destination, incoming)
         with patch.object(self.window.player, "stop") as stop, patch.object(self.window.player, "setSource") as source:
             self.assertTrue(self.window.import_json_path(destination))
             stop.assert_not_called()
@@ -135,6 +137,21 @@ class PlayerIntegrationTests(unittest.TestCase):
         restored = Store(self.window.store.path).load()[0]
         self.assertEqual(restored[0].id, existing.id)
         self.assertIs(restored[1].tracks[0], restored[0].tracks[0])
+
+    def test_import_same_source_with_distinct_ids_keeps_independent_songs(self):
+        existing = LibraryEntry("Keep original", BV, tracks=[Track("Keep original", BV, 1, 1)], resolved=True)
+        self.window.entries = [existing]
+        self.window._normalize_library()
+        destination = self.root / "incoming.json"
+        write_library(destination, self.entries())
+        self.assertTrue(self.window.import_json_path(destination))
+        self.assertEqual([entry.title for entry in self.window.entries],
+                         ["Keep original", "Album", "Single", "Song A"])
+        self.assertIs(self.window.entries[1].tracks[0], self.window.entries[3].tracks[0])
+        self.assertIsNot(self.window.entries[1].tracks[0], self.window.entries[0].tracks[0])
+        identifiers = [entry.id for entry in self.window.entries]
+        self.assertTrue(self.window.import_json_path(destination))
+        self.assertEqual([entry.id for entry in self.window.entries], identifiers)
 
     def test_invalid_import_and_failed_save_do_not_change_library(self):
         existing = self.entries()

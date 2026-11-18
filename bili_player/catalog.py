@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from uuid import uuid4
 
 from .models import LibraryEntry, Track
@@ -28,10 +28,10 @@ def _validate_entries(entries: object) -> None:
         entry.__post_init__()
 
 
-def normalize_library(entries: list[LibraryEntry]) -> list[LibraryEntry]:
-    """Normalize in place: singles own songs; album tracks reference those songs.
+def _normalize_legacy(entries: list[LibraryEntry]) -> list[LibraryEntry]:
+    """Migrate pre-entity snapshots using legacy source matching.
 
-    就地规范化：单曲拥有歌曲实体，专辑曲目引用同一实体。
+    使用旧版来源匹配规则迁移尚未使用实体 ID 的快照。
     """
     _validate_entries(entries)
     singles: dict[Source, list[LibraryEntry]] = {}
@@ -145,6 +145,103 @@ def normalize_library(entries: list[LibraryEntry]) -> list[LibraryEntry]:
     return entries
 
 
+def normalize_library(entries: list[LibraryEntry]) -> list[LibraryEntry]:
+    """Normalize an ID graph in place; equal sources remain independent songs.
+
+    按 ID 就地规范化；来源相同的歌曲仍是独立实体。
+    """
+    _validate_entries(entries)
+    retained: list[LibraryEntry] = []
+    by_id: dict[str, LibraryEntry] = {}
+    for entry in entries:
+        previous = by_id.get(entry.id)
+        if previous is not None:
+            if previous.kind != entry.kind:
+                raise ValueError("单曲和专辑不能使用同一个 ID")
+            continue
+        by_id[entry.id] = entry
+        retained.append(entry)
+    songs = {entry.id: entry for entry in retained if entry.kind == "single"}
+    # Snapshot reference identities before assigning canonical IDs to owner tracks.
+    aliases: dict[str, str] = {}
+    objects: dict[int, str] = {}
+    candidates: dict[str, list[Track]] = {identifier: [] for identifier in songs}
+    owner_objects: set[int] = set()
+    for identifier, song in songs.items():
+        if len(song.tracks) > 1:
+            raise ValueError("单曲最多只能包含一首歌曲")
+        if song.tracks and id(song.tracks[0]) in owner_objects:
+            song.tracks[0] = replace(song.tracks[0])
+        for track in song.tracks:
+            owner_objects.add(id(track))
+            if not track.song_id or track.song_id == identifier:
+                aliases.setdefault(track.id, identifier)
+                objects.setdefault(id(track), identifier)
+            candidates[identifier].append(track)
+    memberships: list[tuple[LibraryEntry, list[str]]] = []
+    for folder in retained:
+        if folder.kind != "album":
+            continue
+        members: list[str] = []
+        for track in folder.tracks:
+            identifier = (track.song_id or objects.get(id(track))
+                          or (track.id if track.id in songs else aliases.get(track.id, track.id)))
+            if identifier in by_id and by_id[identifier].kind != "single":
+                raise ValueError("专辑曲目引用了专辑 ID")
+            if identifier not in songs:
+                song = LibraryEntry(track.title, track.bvid, page=track.page, id=identifier,
+                                    artist=track.artist, date=track.date, cover=folder.cover)
+                songs[identifier] = by_id[identifier] = song
+                candidates[identifier] = []
+            candidates[identifier].append(track)
+            if identifier not in members:
+                members.append(identifier)
+        memberships.append((folder, members))
+    used_tracks: set[int] = set()
+    for identifier, song in songs.items():
+        options = candidates[identifier]
+        song._song_aliases = set(getattr(song, "_song_aliases", ())) | {item.id for item in options}
+        track = options[0] if options else None
+        if track is not None and id(track) in used_tracks:
+            track = replace(track)
+        if track is not None:
+            used_tracks.add(id(track))
+        previous = getattr(song, "_song_metadata", {})
+        previous_track = getattr(song, "_song_track", None)
+        metadata = {}
+        for name in ("title", "artist", "date"):
+            value = next((value for value in [getattr(song, name),
+                         *(getattr(candidate, name) for candidate in options)] if value.strip()), "")
+            if name in previous:
+                if getattr(song, name) != previous[name]:
+                    value = getattr(song, name)
+                elif track is not None and track is previous_track and getattr(track, name) != previous[name]:
+                    value = getattr(track, name)
+            setattr(song, name, value)
+            if track is not None:
+                setattr(track, name, value)
+            metadata[name] = value
+        song._song_metadata = metadata
+        song._song_track = track
+        if track is not None:
+            if not track.duration:
+                track.duration = next((candidate.duration for candidate in options if candidate.duration), 0)
+            # The owner ID is authoritative even for freshly resolved API tracks.
+            track.id = track.song_id = identifier
+            song.bvid, song.page = track.bvid, track.page
+            song.tracks[:] = [track]
+            song.resolved = True
+        else:
+            song.tracks[:] = []
+            song.resolved = False
+    for folder, members in memberships:
+        folder.tracks[:] = [songs[identifier].tracks[0] for identifier in members]
+    retained_ids = {entry.id for entry in retained}
+    retained.extend(song for identifier, song in songs.items() if identifier not in retained_ids)
+    entries[:] = retained
+    return entries
+
+
 def merge_libraries(
     existing: list[LibraryEntry], incoming: list[LibraryEntry],
 ) -> list[LibraryEntry]:
@@ -154,21 +251,52 @@ def merge_libraries(
     """
     _validate_entries(incoming)
     normalize_library(existing)
+    if incoming is existing:
+        return existing
+    normalize_library(incoming)
     known_ids = {entry.id for entry in existing}
-    # Existing albums are folders: their IDs, rather than BV, identify them.
-    existing_sources = {_single_source(entry) for entry in existing if entry.kind == "single"}
-    for entry in list(incoming):
-        if entry.kind == "album" and entry.id in known_ids:
-            continue
-        if entry.kind == "single" and _single_source(entry) in existing_sources:
-            # Keep fallback metadata available to normalization without replacing owners.
+    for entry in incoming:
+        if entry.id not in known_ids:
             existing.append(entry)
-            continue
-        if entry.id in known_ids:
-            entry.id = str(uuid4())
-        existing.append(entry)
-        known_ids.add(entry.id)
+            known_ids.add(entry.id)
     return normalize_library(existing)
+
+
+def copy_entries(
+    entries: list[LibraryEntry], entry_ids: list[str] | None = None,
+) -> list[LibraryEntry]:
+    """Return detached copies of selected cards and their independent member songs.
+
+    返回所选卡片和成员歌曲的独立副本；所选副本之间保留共享引用。
+    """
+    from copy import deepcopy
+
+    detached = deepcopy(entries)
+    normalize_library(detached)
+    requested = None if entry_ids is None else set(entry_ids)
+    if requested is not None and requested - {entry.id for entry in detached}:
+        raise ValueError("要复制的条目不存在")
+    selected = [entry for entry in detached if requested is None or entry.id in requested]
+    originals = {entry.id: entry for entry in detached}
+    copies: dict[str, LibraryEntry] = {}
+
+    def clone(entry: LibraryEntry) -> LibraryEntry:
+        if entry.id in copies:
+            return copies[entry.id]
+        copied = replace(entry, id=str(uuid4()), tracks=[])
+        copies[entry.id] = copied
+        if entry.kind == "single":
+            copied.tracks[:] = [replace(track, id=copied.id, song_id=copied.id)
+                                for track in entry.tracks]
+        else:
+            copied.tracks[:] = [clone(originals[track.song_id]).tracks[0]
+                                for track in entry.tracks]
+        return copied
+
+    result = [clone(entry) for entry in selected]
+    selected_ids = {entry.id for entry in selected}
+    result.extend(copied for identifier, copied in copies.items() if identifier not in selected_ids)
+    return normalize_library(result)
 
 
 def find_song(entries: list[LibraryEntry], song_id: str) -> LibraryEntry | None:
@@ -193,21 +321,21 @@ def delete_song(entries: list[LibraryEntry], song_id: str) -> list[LibraryEntry]
     就地删除歌曲实体及其在所有专辑中的引用。
     """
     normalize_library(entries)
-    song = find_song(entries, song_id)
+    song = next((entry for entry in entries
+                 if entry.kind == "single" and entry.id == song_id), None)
     if song is None:
         return entries
-    source = song.bvid, song.page
     for entry in entries:
         if entry.kind == "album":
-            entry.tracks[:] = [track for track in entry.tracks if _source(track) != source]
+            entry.tracks[:] = [track for track in entry.tracks if track.song_id != song_id]
     entries[:] = [entry for entry in entries if entry is not song]
     return entries
 
 
 def encode_library(entries: list[LibraryEntry]) -> dict:
-    """Encode v3: album folders contain only canonical song IDs.
+    """Encode v4: album folders contain only song IDs; equal sources are valid.
 
-    编码为 v3：专辑文件夹只保存标准歌曲 ID。
+    编码为 v4：专辑文件夹只保存歌曲 ID，允许来源完全相同的独立歌曲。
     """
     normalize_library(entries)
     encoded = []
@@ -217,7 +345,7 @@ def encode_library(entries: list[LibraryEntry]) -> dict:
             item.pop("tracks")
             item["song_ids"] = [track.song_id for track in entry.tracks]
         encoded.append(item)
-    return {"version": 3, "entries": encoded}
+    return {"version": 4, "entries": encoded}
 
 
 def _entry_from_dict(item: object) -> LibraryEntry:
@@ -232,15 +360,15 @@ def _entry_from_dict(item: object) -> LibraryEntry:
 
 
 def decode_library(payload: dict) -> list[LibraryEntry]:
-    """Decode old nested snapshots or v3 references, validating before migration.
+    """Decode nested v1/v2 snapshots or ID graphs in v3/v4.
 
-    解码旧版嵌套快照或 v3 引用，在迁移前验证数据。
+    解码 v1/v2 嵌套快照或 v3/v4 ID 图结构，迁移前验证完整数据。
     """
     try:
         if not isinstance(payload, dict) or type(payload.get("version")) is not int:
             raise ValueError("不支持的音乐库格式")
         version = payload["version"]
-        if version not in (1, 2, 3) or not isinstance(payload.get("entries"), list):
+        if version not in (1, 2, 3, 4) or not isinstance(payload.get("entries"), list):
             raise ValueError("不支持的音乐库格式")
         entries = []
         references = []
@@ -250,10 +378,10 @@ def decode_library(payload: dict) -> list[LibraryEntry]:
             if not isinstance(item, dict):
                 raise ValueError("音乐库条目必须是对象")
             fields = dict(item)
-            if version == 3 and (not isinstance(fields.get("id"), str) or not fields["id"].strip()):
+            if version >= 3 and (not isinstance(fields.get("id"), str) or not fields["id"].strip()):
                 raise ValueError("v3 条目必须保存非空 ID")
             refs = None
-            if version == 3 and fields.get("kind", "single") == "album":
+            if version >= 3 and fields.get("kind", "single") == "album":
                 if "tracks" in fields or "song_ids" not in fields:
                     raise ValueError("v3 专辑必须仅保存歌曲引用")
                 refs = fields.pop("song_ids")
@@ -269,7 +397,7 @@ def decode_library(payload: dict) -> list[LibraryEntry]:
                 if track.id in track_sources and track_sources[track.id] != _source(track):
                     raise ValueError("不同歌曲使用了重复的曲目 ID")
                 track_sources[track.id] = _source(track)
-            if version == 3 and entry.kind == "single":
+            if version >= 3 and entry.kind == "single":
                 if len(entry.tracks) > 1 or (entry.resolved and not entry.tracks):
                     raise ValueError("标准单曲必须恰好包含一首已解析歌曲")
                 if entry.tracks:
@@ -280,12 +408,12 @@ def decode_library(payload: dict) -> list[LibraryEntry]:
             entries.append(entry)
             if refs is not None:
                 references.append((entry, refs))
-        if version == 3:
+        if version >= 3:
             songs = {entry.id: entry for entry in entries if entry.kind == "single"}
             sources: set[Source] = set()
             for song in songs.values():
                 source = song.bvid, song.page
-                if source in sources:
+                if version == 3 and source in sources:
                     raise ValueError("标准单曲来源重复")
                 sources.add(source)
             for album, refs in references:
@@ -293,6 +421,9 @@ def decode_library(payload: dict) -> list[LibraryEntry]:
                     if ref not in songs or not songs[ref].tracks:
                         raise ValueError("专辑引用的歌曲不存在或尚未解析")
                     album.tracks.append(songs[ref].tracks[0])
+        if version < 3 and not any(track.song_id for entry in entries for track in entry.tracks):
+            # Only pre-entity snapshots need source-based migration compatibility.
+            return _normalize_legacy(entries)
         return normalize_library(entries)
     except (TypeError, KeyError) as exc:
         raise ValueError(f"音乐库数据格式不正确：{exc}") from exc

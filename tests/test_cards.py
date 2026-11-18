@@ -84,8 +84,9 @@ class TileTests(unittest.TestCase):
         self.window._normalize_library()
         first, second = self.entries[1], self.entries[3]
         self.entries[0].tracks = list(first.tracks)
-        # An unresolved single can still be recognized by its BV/part membership.
-        self.entries[2].tracks = [Track("Second song", BV, 456, 2)]
+        # Folder membership is explicit by entity ID, independent of video source.
+        second.tracks = [Track("Second song", BV, 456, 2, song_id=second.id)]
+        self.entries[2].tracks = list(second.tracks)
         self.window._normalize_library()
         self.window._render_library()
         self.assertEqual([c.entry_id for c in self.cards()], [self.entries[0].id, self.entries[2].id])
@@ -101,7 +102,7 @@ class TileTests(unittest.TestCase):
             album.tracks = list(song.tracks)
         self.window._render_library()
         self.assertNotIn(song.id, [c.entry_id for c in self.cards()])
-        self.window.delete_entry(self.entries[0])
+        self.window.delete_library_entries([self.entries[0].id], album_contents="keep")
         self.assertNotIn(song.id, [c.entry_id for c in self.cards()])
         edited = self.entries[2]
         from dataclasses import replace

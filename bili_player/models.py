@@ -144,10 +144,10 @@ class Store:
         try:
             original = self.path.read_bytes()
         except FileNotFoundError:
-            return [], [], DEFAULT_VOLUME, dict(_DEFAULT_SETTINGS), 3, b""
+            return [], [], DEFAULT_VOLUME, dict(_DEFAULT_SETTINGS), 4, b""
         try:
             data = json.loads(original.decode("utf-8"))
-            if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2, 3):
+            if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2, 3, 4):
                 raise ValueError("不支持的音乐库格式")
             if not isinstance(data.get("entries"), list) or not isinstance(data.get("tracks"), list):
                 raise ValueError("音乐库列表格式不正确")
@@ -157,7 +157,8 @@ class Store:
             if any(not isinstance(item, dict) for item in data["tracks"]):
                 raise ValueError("播放队列必须是对象列表")
             tracks = [Track(**item) for item in data["tracks"]]
-            self._link_queue(entries, tracks)
+            if data["version"] < 3:
+                self._link_queue(entries, tracks)
             settings = self._validate_settings(data.get("settings", {}) if data["version"] >= 2 else {})
             return entries, tracks, volume, settings, data["version"], original
         except (ValueError, TypeError, KeyError, UnicodeError) as exc:
@@ -165,12 +166,17 @@ class Store:
 
     @staticmethod
     def _link_queue(entries: list[LibraryEntry], tracks: list[Track]) -> None:
+        """Fill missing legacy queue references without changing explicit IDs."""
+        from .catalog import find_song
+
         songs = {(entry.bvid, entry.page): entry.id for entry in entries if entry.kind == "single"}
         for track in tracks:
-            # Queue IDs identify occurrences, and must never be rewritten as song IDs.
-            source_id = songs.get((track.bvid, track.page))
-            if source_id is not None:
-                track.song_id = source_id
+            if track.song_id:
+                continue
+            song = find_song(entries, track.id)
+            identifier = song.id if song is not None else songs.get((track.bvid, track.page))
+            if identifier is not None:
+                track.song_id = identifier
 
     def load(self) -> tuple[list[LibraryEntry], list[Track], int]:
         entries, tracks, volume, settings, _, _ = self._read()
@@ -197,7 +203,6 @@ class Store:
         for track in tracks:
             Track(**asdict(track))
         data = encode_library(entries)
-        self._link_queue(entries, tracks)
         data.update({
             "tracks": [asdict(track) for track in tracks],
             "volume": volume,
@@ -217,8 +222,8 @@ class Store:
                 os.fsync(handle.fileno())
             if version == 1:
                 self._backup_v1(original)
-            elif version == 2:
-                self._backup_legacy(original, 2)
+            elif version in (2, 3):
+                self._backup_legacy(original, version)
             os.replace(temporary, self.path)
             temporary = None
             self.settings = selected_settings

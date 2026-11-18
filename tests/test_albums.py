@@ -255,8 +255,8 @@ class AlbumDialogTests(unittest.TestCase):
         self.assertFalse(dialog.save_button.isEnabled())
         self.parent.complete(0)
         self.assertTrue(dialog.save_button.isEnabled())
-        self.assertEqual(len(dialog._tracks()), 1)
-        self.assertEqual(len({track.id for track in dialog._tracks()}), 1)
+        self.assertEqual(len(dialog._tracks()), 2)
+        self.assertEqual(len({track.id for track in dialog._tracks()}), 2)
 
     def test_import_appends_all_parts_and_preserves_custom_album_title_and_cover(self):
         original = self.album()
@@ -395,7 +395,7 @@ class AlbumDialogTests(unittest.TestCase):
         self.client.get_tracks.assert_not_called()
         self.client.get_video.assert_not_called()
 
-    def test_add_tracks_deduplicates_same_entity_or_source_and_remove_keeps_single(self):
+    def test_add_tracks_deduplicates_song_id_and_preserves_independent_same_source_songs(self):
         track = self.tracks()[0]
         song = LibraryEntry(track.title, track.bvid, id=track.id, tracks=[track], resolved=True)
         album = self.album(tracks=[])
@@ -404,10 +404,12 @@ class AlbumDialogTests(unittest.TestCase):
         self.addCleanup(parent.close)
         dialog = dialogs.AlbumDialog(parent, album, [song])
         self.open_dialogs.append(dialog)
-        dialog.add_tracks([track, deepcopy(track), replace(track, id="same-source-alias")])
-        self.assertEqual([member.id for member in dialog._tracks()], [song.id])
+        independent = replace(track, id="same-source-independent", song_id="independent-song")
+        dialog.add_tracks([track, deepcopy(track), replace(track, id="same-song-reference"), independent])
+        self.assertEqual([member.id for member in dialog._tracks()], [song.id, independent.id])
+        self.assertEqual([member.song_id for member in dialog._tracks()], [song.id, "independent-song"])
         self.assertIsNot(dialog._tracks()[0], track)
-        self.select_rows(dialog, 0)
+        self.select_rows(dialog, 0, 1)
         dialog.remove_selected()
         self.assertEqual(dialog.value().tracks, [])
         self.assertIs(parent._find(song.id), song)
@@ -415,6 +417,60 @@ class AlbumDialogTests(unittest.TestCase):
         dialog.add_tracks([track])
         self.assertEqual(dialog._tracks()[0].id, song.id)
         self.assertEqual(album.tracks, [])
+
+    def test_existing_same_source_singles_keep_distinct_song_ids_and_reference_ids(self):
+        source = self.tracks()[0]
+        singles = [
+            LibraryEntry("First identity", BVID, id="first-song", tracks=[source], resolved=True),
+            LibraryEntry("Second identity", BVID, id="second-song", tracks=[deepcopy(source)], resolved=True),
+        ]
+        dialog = self.open_album(self.album(tracks=[]), singles)
+        self.picker("_SinglesDialog", singles)
+        dialog.add_existing_singles()
+        self.parent.complete(0)
+        dialog.add_existing_singles()
+        self.parent.complete(1)
+        tracks = dialog._tracks()
+        self.assertEqual([track.song_id for track in tracks], ["first-song", "second-song"])
+        self.assertEqual([track.id for track in tracks], [source.id, source.id])
+        self.assertEqual([track.title for track in tracks], ["First identity", "Second identity"])
+        self.assertEqual(source.song_id, "")
+        self.client.get_tracks.assert_not_called()
+
+    def test_local_editor_targets_song_id_when_cached_reference_ids_are_equal(self):
+        source = self.tracks()[0]
+        first = replace(source, song_id="first-song")
+        second = replace(source, song_id="second-song")
+        dialog = self.open_album(self.album(tracks=[first, second]))
+        self.select_rows(dialog, 1)
+        self.picker("TrackDialog", replace(second, title="Only second identity"))
+        dialog.edit_selected()
+        self.assertEqual([track.title for track in dialog._tracks()], [source.title, "Only second identity"])
+        self.assertEqual([track.song_id for track in dialog._tracks()], ["first-song", "second-song"])
+
+    def test_uncached_existing_single_resolution_preserves_song_identity(self):
+        single = LibraryEntry("Uncached", BVID, id="uncached-song")
+        self.client.get_tracks.side_effect = None
+        self.client.get_tracks.return_value = [self.tracks()[0]]
+        dialog = self.open_album(self.album(tracks=[]), [single])
+        self.picker("_SinglesDialog", [single])
+        dialog.add_existing_singles()
+        self.parent.complete(0)
+        self.assertEqual((dialog._tracks()[0].id, dialog._tracks()[0].song_id), (single.id, single.id))
+
+    def test_editor_select_all_clear_and_reference_identity_survive_reordering(self):
+        tracks = [replace(track, song_id=f"song-{i}") for i, track in enumerate(self.tracks())]
+        dialog = self.open_album(self.album(tracks=tracks))
+        dialog.select_all_button.click()
+        self.assertEqual(len(dialog.tracks_list.selectedItems()), 3)
+        self.assertEqual(dialog.selection_label.text(), "已选择 3 首")
+        self.assertFalse(dialog.select_all_button.isEnabled())
+        dialog.clear_selection_button.click()
+        self.assertFalse(dialog.tracks_list.selectedItems())
+        self.assertFalse(dialog.remove_button.isEnabled())
+        self.select_rows(dialog, 1)
+        dialog.move_selected(-1)
+        self.assertEqual([track.song_id for track in dialog.value().tracks], ["song-1", "song-0", "song-2"])
 
     def test_changed_source_refreshes_cid_and_keeps_user_metadata_and_identity(self):
         original = self.album()

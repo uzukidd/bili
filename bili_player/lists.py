@@ -6,7 +6,7 @@ Only the caller decides whether a completed snapshot is saved / 由调用者确�
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
@@ -56,6 +56,7 @@ class ListImportResult:
     album: LibraryEntry
     skipped: list[str]
     total: int
+    songs: list[LibraryEntry] = field(default_factory=list)
 
 
 class ListImportCancelled(BilibiliError):
@@ -262,6 +263,7 @@ class BilibiliListClient(BilibiliClient):
         listing = self.get_listing(source, cancelled=cancelled)
         count = len(listing.bvids)
         tracks: list[Track] = []
+        songs: list[LibraryEntry] = []
         skipped: list[str] = []
         cover = listing.cover
         _check_cancelled(cancelled)
@@ -281,6 +283,11 @@ class BilibiliListClient(BilibiliClient):
                     title=track.title if expand_parts else video.title,
                     bvid=track.bvid, cid=track.cid, page=track.page, duration=track.duration,
                 ) for track in selected]
+                video_cover = _cover(video.cover)
+                video_songs = [LibraryEntry(
+                    track.title, track.bvid, page=track.page,
+                    tracks=[track], cover=video_cover, resolved=True,
+                ) for track in copied]
             except ListImportCancelled:
                 raise
             except BilibiliError as exc:
@@ -292,8 +299,9 @@ class BilibiliListClient(BilibiliClient):
                 skipped.append(f"{bvid}：视频分 P 数据不完整：{exc}")
             else:
                 tracks.extend(copied)
+                songs.extend(video_songs)
                 if not cover:
-                    cover = _cover(video.cover)
+                    cover = video_cover
             if progress:
                 progress(index, count, bvid)
             _check_cancelled(cancelled)
@@ -301,4 +309,4 @@ class BilibiliListClient(BilibiliClient):
             notes = "；".join(skipped)
             raise BilibiliError("列表中没有可播放的曲目" + (f"：{notes}" if notes else ""))
         album = LibraryEntry(listing.title, kind="album", tracks=tracks, cover=cover, resolved=True)
-        return ListImportResult(album, skipped, listing.total)
+        return ListImportResult(album, skipped, listing.total, songs)

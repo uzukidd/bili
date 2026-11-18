@@ -8,7 +8,6 @@ import unittest
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
-from uuid import UUID
 
 from bili_player.exchange import dumps_library, loads_library, read_library, write_library
 from bili_player.models import LibraryEntry, Track
@@ -46,7 +45,7 @@ class ExchangeTests(unittest.TestCase):
         self.assertIn("中文专辑", text)
         payload = json.loads(text)
         self.assertEqual(set(payload), {"format", "version", "entries"})
-        self.assertEqual((payload["format"], payload["version"]), ("bili-music-library", 2))
+        self.assertEqual((payload["format"], payload["version"]), ("bili-music-library", 3))
         for item in payload["entries"]:
             if item["kind"] == "album":
                 self.assertNotIn("tracks", item)
@@ -68,15 +67,16 @@ class ExchangeTests(unittest.TestCase):
         self.assertEqual((empty.tracks, empty.resolved), ([], True))
         self.assertEqual(entries, before)
 
-    def test_new_ids_preserve_shared_songs_and_imports_are_independent(self):
+    def test_ids_preserve_shared_songs_and_import_objects_are_independent(self):
         another_album = copy.deepcopy(self.album)
         another_album.id = "second-album"
         text = dumps_library([self.album, another_album, self.single])
         first, second = loads_library(text), loads_library(text)
-        identifiers = [entry.id for entry in first + second]
+        identifiers = [entry.id for entry in first]
+        self.assertEqual(identifiers, [entry.id for entry in second])
         self.assertEqual(len(identifiers), len(set(identifiers)))
-        self.assertTrue(all(str(UUID(identifier)) == identifier for identifier in identifiers))
-        self.assertTrue({"album-entry", "single-entry", "second-album", "same-track"}.isdisjoint(identifiers))
+        self.assertIn("album-entry", identifiers)
+        self.assertIn("single-entry", identifiers)
         albums = [entry for entry in first if entry.kind == "album"]
         singles = [entry for entry in first if entry.kind == "single"]
         self.assertEqual((len(albums), len(singles)), (2, 2))
@@ -129,7 +129,7 @@ class ExchangeTests(unittest.TestCase):
                 imported = loads_library(json.dumps(payload))[0]
                 self.assertEqual((imported.artist, imported.date, imported.cover, imported.tracks), ("", "", "", []))
                 self.assertFalse(imported.resolved)
-                self.assertNotEqual(imported.id, "legacy")
+                self.assertEqual(imported.id, "legacy")
 
     def test_old_nested_tracks_default_optional_metadata(self):
         legacy = {"title": "旧专辑", "bvid": BVID, "kind": "album", "resolved": True,
@@ -153,9 +153,9 @@ class ExchangeTests(unittest.TestCase):
 
     def test_bad_payloads_versions_and_formats_have_chinese_errors(self):
         bad = [None, b"{}", "", "{", "[]", "null", "true", document([], version=True),
-               document([], version=1.0), document([], version="1"), document([], version=3),
+               document([], version=1.0), document([], version="1"), document([], version=4),
                document([], version=99), document([], format="other"), document([], format=None),
-               json.dumps({"version": 4, "entries": []}), json.dumps({"entries": []}),
+               json.dumps({"version": 5, "entries": []}), json.dumps({"entries": []}),
                document(None), document({}), document([None]), document([[]])]
         for text in bad:
             with self.subTest(text=text), self.assertRaisesRegex(ValueError, "[\u4e00-\u9fff]"):
@@ -173,7 +173,7 @@ class ExchangeTests(unittest.TestCase):
             malformed = asdict(self.album)
             malformed.update(overrides)
             with self.subTest(overrides=overrides), \
-                 patch("bili_player.exchange.uuid4") as new_id, \
+                 patch("bili_player.catalog.uuid4") as new_id, \
                  self.assertRaisesRegex(ValueError, "[\u4e00-\u9fff]"):
                 loads_library(document([asdict(self.single), malformed]))
             new_id.assert_not_called()
@@ -220,12 +220,11 @@ class ExchangeTests(unittest.TestCase):
         for item in payload["entries"][:2]:
             self.assertEqual(item["song_ids"], [serialized_song["id"]])
             self.assertNotIn("tracks", item)
-        from uuid import uuid4
-        with patch("bili_player.exchange.uuid4", wraps=uuid4) as new_id:
+        with patch("bili_player.catalog.uuid4") as new_id:
             imported = loads_library(json.dumps(payload))
-        self.assertEqual(new_id.call_count, 3)
+        new_id.assert_not_called()
         restored_song = next(entry for entry in imported if entry.kind == "single")
-        self.assertNotEqual(restored_song.id, "song")
+        self.assertEqual(restored_song.id, "song")
         self.assertEqual((restored_song.tracks[0].id, restored_song.tracks[0].song_id),
                          (restored_song.id, restored_song.id))
         self.assertEqual((restored_song.artist, restored_song.date),
@@ -276,7 +275,7 @@ class ExchangeTests(unittest.TestCase):
                             album["song_ids"] * 2):
             malformed = copy.deepcopy(valid)
             next(item for item in malformed["entries"] if item["kind"] == "album")["song_ids"] = replacement
-            with self.subTest(refs=replacement), patch("bili_player.exchange.uuid4") as new_id, \
+            with self.subTest(refs=replacement), patch("bili_player.catalog.uuid4") as new_id, \
                  self.assertRaisesRegex(ValueError, "[\u4e00-\u9fff]"):
                 loads_library(json.dumps(malformed))
             new_id.assert_not_called()
@@ -302,7 +301,7 @@ class ExchangeFileTests(unittest.TestCase):
         self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
         imported = read_library(self.path)
         self.assertEqual((imported[0].title, imported[0].artist, imported[0].date), ("歌曲", "作者", "任意日期"))
-        self.assertNotEqual(imported[0].id, self.entry.id)
+        self.assertEqual(imported[0].id, self.entry.id)
         write_library(self.path, [])
         self.assertEqual(read_library(self.path), [])
         self.assertEqual(list(self.directory.glob("*.tmp")), [])

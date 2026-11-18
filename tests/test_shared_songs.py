@@ -131,7 +131,7 @@ class SharedSongTests(unittest.TestCase):
         self.window.save_album(snapshot)
         self.assertEqual(self.first.tracks, [])
         self.assertIs(self.window._find(self.song.id), self.song)
-        self.window.delete_entry(self.second)
+        self.window.delete_library_entries([self.second.id], album_contents="keep")
         self.assertIs(self.window._find(self.song.id), self.song)
         self.assertTrue(self.song.tracks)
         self.window.delete_entry(self.song)
@@ -202,32 +202,62 @@ class SharedSongTests(unittest.TestCase):
         self.assertEqual(self.window.current_id, expected)
         self.assertEqual(inserted.data(Qt.ItemDataRole.UserRole).song_id, self.song.id)
 
-    def test_source_change_to_existing_song_is_rejected_without_losing_entities(self):
-        other = LibraryEntry("Other", BV, page=2, tracks=[Track("Other", BV, 456, 2)], resolved=True)
+    def test_source_change_to_existing_source_resolves_and_preserves_independent_entities(self):
+        from bili_player.api import VideoInfo
+
+        other = LibraryEntry("Other", BV, page=2, artist="Other author", date="Other date",
+                             tracks=[Track("Other", BV, 456, 2)], resolved=True)
         self.window.entries.append(other)
         self.window._normalize_library()
+        self.window.resolve_entry(self.first, False)
+        self.window.resolve_entry(other, False)
+        queued_before = deepcopy(self.window._tracks())
+        other_before = deepcopy(other)
+        original_id = self.song.id
         updated = deepcopy(self.song)
         updated.bvid, updated.page = other.bvid, other.page
+        updated.title, updated.artist, updated.date = "Independent edited title", "Edited author", "Edited date"
         updated.tracks, updated.resolved = [], False
         editor = Mock()
         editor.exec.return_value = QDialog.DialogCode.Accepted
         editor.value.return_value = updated
+        info = VideoInfo("Remote title", "resolved-cover.png", [Track("Remote", BV, 456, 2)])
         with patch("bili_player.app.EntryDialog", return_value=editor), patch.object(self.window, "_submit") as submit:
             self.window.edit_single(self.song)
-            submit.assert_not_called()
-        self.window._error.assert_called_once()
-        self.assertEqual(self.song.page, 1)
+            submit.assert_called_once()
+            load, loaded = submit.call_args.args
+            self.assertEqual(self.song.page, 1)
+            with patch("bili_player.app.BilibiliClient") as client:
+                client.return_value.get_video.return_value = info
+                self.assertIs(load(), info)
+                client.return_value.get_video.assert_called_once_with(updated)
+            loaded(info)
+
+        self.window._error.assert_not_called()
+        self.assertEqual(self.song.id, original_id)
+        self.assertEqual((self.song.bvid, self.song.page), (other.bvid, other.page))
+        self.assertEqual((self.song.title, self.song.artist, self.song.date),
+                         ("Independent edited title", "Edited author", "Edited date"))
+        self.assertEqual((self.song.tracks[0].id, self.song.tracks[0].song_id), (original_id, original_id))
         self.assertIs(self.first.tracks[0], self.song.tracks[0])
+        self.assertIs(self.second.tracks[0], self.song.tracks[0])
+        self.assertIsNot(self.song.tracks[0], other.tracks[0])
+        self.assertEqual(other, other_before)
         self.assertIs(self.window._find(other.id), other)
-        self.assertEqual(len([e for e in self.window.entries if e.kind == "single"]), 2)
-        self.window._error.reset_mock()
-        updated.tracks = [Track("Late source", BV, 456, 2)]
-        updated.resolved = True
-        self.window._commit_song_edit(self.song, updated)
-        self.window._error.assert_called_once()
-        self.assertEqual(self.song.page, 1)
-        self.assertEqual(other.title, "Other")
-        self.assertEqual(len(self.second.tracks), 1)
+        self.assertEqual(len([entry for entry in self.window.entries if entry.kind == "single"]), 2)
+        queued = self.window._tracks()
+        self.assertEqual([track.id for track in queued], [track.id for track in queued_before])
+        self.assertEqual((queued[0].song_id, queued[0].title, queued[0].page),
+                         (original_id, updated.title, 2))
+        self.assertEqual(queued[1], queued_before[1])
+
+        saved = Store(self.window.store.path).load()[0]
+        saved_song, saved_other = find_song(saved, original_id), find_song(saved, other.id)
+        self.assertIsNotNone(saved_song)
+        self.assertIsNotNone(saved_other)
+        self.assertEqual((saved_song.bvid, saved_song.page), (saved_other.bvid, saved_other.page))
+        self.assertEqual(saved_other, other_before)
+        self.assertIsNot(saved_song.tracks[0], saved_other.tracks[0])
 
     def test_custom_title_controls_and_symmetric_mini_mode_button(self):
         self.assertTrue(self.window.windowFlags() & Qt.WindowType.FramelessWindowHint)

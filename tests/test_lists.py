@@ -197,6 +197,19 @@ class ImportTests(unittest.TestCase):
         self.assertEqual([call.args for call in progress.call_args_list], [(0, 3, ""), (1, 3, A), (2, 3, B), (3, 3, C)])
         self.assertTrue(all(call.args[0].kind == "album" for call in self.client.get_video.call_args_list))
 
+    def test_each_imported_song_keeps_its_video_cover(self):
+        for bvid, info in self.videos.items():
+            info.cover = f"//example.com/{bvid}.jpg"
+        for expand in (True, False):
+            with self.subTest(expand=expand):
+                result = self.client.import_album(self.source, expand_parts=expand)
+                self.assertEqual(result.album.cover, self.listing.cover)
+                self.assertEqual(len(result.songs), len(result.album.tracks))
+                for song, track in zip(result.songs, result.album.tracks):
+                    self.assertEqual(song.cover, f"https://example.com/{track.bvid}.jpg")
+                    self.assertIs(song.tracks[0], track)
+                    self.assertEqual(song.page, track.page)
+
     def test_first_part_only_uses_video_title_and_first_successful_cover(self):
         self.listing.cover = ""
         self.videos[A].cover = ""

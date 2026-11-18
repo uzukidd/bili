@@ -4,6 +4,18 @@ from __future__ import annotations
 import re
 
 ENGLISH = {
+    "退出多选": "Exit selection", "删除": "Delete",
+    "批量导出": "Export selected", "暂未实现": "Not implemented yet",
+    "多选": "Select", "批量操作": "Batch actions",
+    "全选": "Select all", "清除选择": "Clear selection",
+    "已选择 {count} 项": "{count} selected", "已选择 {count} 首": "{count} selected",
+    "选择 {title}": "Select {title}", "复制": "Copy", "复制所选": "Copy selected",
+    "已复制 {count} 项": "Copied {count} items", "删除所选": "Delete selected",
+    "从专辑移除": "Remove from album", "添加所选到队列": "Add selected to queue",
+    "删除专辑": "Delete albums", "保留单曲": "Keep songs", "一并删除单曲": "Delete songs too",
+    "删除 {count} 个专辑时，如何处理其中的单曲？": "What should happen to the songs in these {count} albums?",
+    "保留单曲会将它们移出所选专辑，未属于其他专辑的歌曲会成为无专辑单曲。一并删除会从音乐库及其他专辑中删除这些实体。": "Keeping songs removes the selected folders; songs without other albums become unfiled. Deleting songs too removes these entities from the library and all other albums.",
+    "勾选要添加到专辑的单曲，同一首歌曲的修改会同步到所有专辑。": "Select singles to add to this album. Song edits are shared across albums.",
     "该视频分 P 已有单曲，请直接编辑已有歌曲。": "A song already uses that video part. Please edit the existing song.",
     "Bili Music · B站音乐播放器": "Bili Music · Bilibili Music Player",
     "最小化": "Minimize", "最大化": "Maximize", "还原窗口": "Restore",

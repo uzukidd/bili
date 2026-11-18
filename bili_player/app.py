@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .api import BilibiliClient
-from .catalog import normalize_library, merge_libraries, find_song, delete_song
+from .catalog import normalize_library, merge_libraries, find_song, delete_song, copy_entries
 from .cards import CardArtwork, LibraryCard, LibraryGrid
 from .covers import CoverCache
 from .details import EntryDetailsDialog
@@ -258,6 +258,10 @@ class MainWindow(QMainWindow):
         self._library_drag_group = str(uuid4())
         self._library_drag_active = False
         self._library_render_pending = False
+        self._selection_mode = False
+        self._selected_entry_ids: set[str] = set()
+        self._selection_anchor = None
+        self._visible_entry_ids = []
         self._normal_geometry = None
         self._normal_maximized = False
         self._want_playing = False
@@ -399,6 +403,25 @@ class MainWindow(QMainWindow):
         lib_layout.addLayout(filter_row)
         self.library_count = label(name="muted")
         lib_layout.addWidget(self.library_count)
+        self.selection_tools = QWidget()
+        batch_tools = QHBoxLayout(self.selection_tools)
+        batch_tools.setContentsMargins(0, 0, 0, 0)
+        self.exit_selection_button = self._button("退出多选", self.exit_library_selection)
+        self.batch_copy_button = self._button("复制", lambda: self.copy_library_entries(
+            [entry.id for entry in self._selected_library_entries()]))
+        self.batch_delete_button = self._button("删除", lambda: self.delete_library_entries(
+            [entry.id for entry in self._selected_library_entries()]))
+        self.batch_export_button = self._button("批量导出", lambda: None)
+        self.batch_export_button.setEnabled(False)
+        self._bind(self.batch_export_button, "暂未实现", "setToolTip")
+        for widget in (self.exit_selection_button, self.batch_copy_button,
+                       self.batch_delete_button, self.batch_export_button):
+            batch_tools.addWidget(widget)
+        self.selection_count = label(name="muted")
+        batch_tools.addWidget(self.selection_count)
+        batch_tools.addStretch()
+        self.selection_tools.hide()
+        lib_layout.addWidget(self.selection_tools)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -427,7 +450,7 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         queue_layout.addWidget(hint)
         self.queue = QListWidget()
-        self.queue.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.queue.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.queue.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.queue.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.queue.itemDoubleClicked.connect(self.play_item)
@@ -753,9 +776,6 @@ class MainWindow(QMainWindow):
         entry = find_song(self.entries, track.song_id) if track.song_id else None
         if entry is None:
             entry = next((e for e in self.entries if any(t.id == track.id for t in e.tracks)), None)
-        if entry is None:
-            entry = next((e for e in self.entries if any(
-                (t.bvid, t.cid) == (track.bvid, track.cid) for t in e.tracks)), None)
         if entry and entry.cover:
             self._load_cover(entry.cover, self.mini_cover)
 
@@ -886,12 +906,12 @@ class MainWindow(QMainWindow):
         kind = {1: "album", 2: "single"}.get(self.tabs.currentIndex())
         album_song_ids = {track.song_id or track.id for entry in self.entries if entry.kind == "album"
                           for track in entry.tracks}
-        album_sources = {(track.bvid, track.page) for entry in self.entries if entry.kind == "album"
-                         for track in entry.tracks}
         entries = [e for e in self.entries if (not kind or e.kind == kind)
-                   and (kind is not None or e.kind == "album" or
-                        (e.id not in album_song_ids and (e.bvid, e.page) not in album_sources))
+                   and (kind is not None or e.kind == "album" or e.id not in album_song_ids)
                    and (query in e.title.lower() or query in e.bvid.lower())]
+        self._visible_entry_ids = [e.id for e in entries]
+        self._selected_entry_ids.intersection_update(self._visible_entry_ids)
+        self._refresh_library_selection()
         self.library_count.setText(self.tr("{total} 项收藏 · 当前显示 {shown} 项", total=len(self.entries), shown=len(entries)))
         if not entries:
             empty = QFrame()
@@ -915,6 +935,7 @@ class MainWindow(QMainWindow):
             card.openRequested.connect(lambda _id, e=entry: self.open_entry(e))
             card.playRequested.connect(lambda _id, e=entry: self.resolve_entry(e, True))
             card.menuRequested.connect(lambda _id, pos, e=entry: self._entry_menu(e, pos))
+            card.selectionRequested.connect(self.select_library_entry)
             art = CardArtwork(self.theme)
             art.setAccessibleName(entry.title)
             art.setToolTip(self.tr("打开专辑" if entry.kind == "album" else "打开单曲详情"))
@@ -923,11 +944,157 @@ class MainWindow(QMainWindow):
             else:
                 subtitle = entry.tracks[0].artist if entry.tracks and entry.tracks[0].artist else self.tr("单曲 · P{page}", page=entry.page)
             card.set_content(art, entry.title, subtitle, self.tr("播放"))
+            card.set_selection(self._selection_mode, entry.id in self._selected_entry_ids)
+            card.selection_box.setAccessibleName(self.tr("选择 {title}", title=entry.title))
             card.subtitle_label.setToolTip(subtitle + ("\n" + entry.bvid if entry.bvid else ""))
             if entry.cover:
                 self._load_cover(entry.cover, art)
             cards.append(card)
         self.cards.show_cards(cards)
+
+    def enter_library_selection(self, identity):
+        if identity not in self._visible_entry_ids:
+            return
+        self._selection_mode = True
+        self._selected_entry_ids.add(identity)
+        self._selection_anchor = identity
+        self._refresh_library_selection()
+
+    def exit_library_selection(self):
+        self._selection_mode = False
+        self._selected_entry_ids.clear()
+        self._selection_anchor = None
+        self._refresh_library_selection()
+
+    def _refresh_library_selection(self):
+        self.selection_tools.setVisible(self._selection_mode)
+        self.selection_count.setText(self.tr("已选择 {count} 项", count=len(self._selected_entry_ids)))
+        for widget in (self.batch_copy_button, self.batch_delete_button):
+            widget.setEnabled(bool(self._selected_entry_ids))
+        for card in self.cards._cards:
+            card.set_selection(self._selection_mode, card.entry_id in self._selected_entry_ids)
+
+    def select_library_entry(self, identity, modifiers=Qt.KeyboardModifier.NoModifier):
+        if identity not in self._visible_entry_ids:
+            return
+        self._selection_mode = True
+        if modifiers & Qt.KeyboardModifier.ShiftModifier and self._selection_anchor in self._visible_entry_ids:
+            first = self._visible_entry_ids.index(self._selection_anchor)
+            last = self._visible_entry_ids.index(identity)
+            self._selected_entry_ids.update(self._visible_entry_ids[min(first, last):max(first, last) + 1])
+        elif identity in self._selected_entry_ids:
+            self._selected_entry_ids.remove(identity)
+        else:
+            self._selected_entry_ids.add(identity)
+        self._selection_anchor = identity
+        self._refresh_library_selection()
+
+    def select_all_library(self):
+        self._selection_mode = True
+        self._selected_entry_ids = set(self._visible_entry_ids)
+        self._refresh_library_selection()
+
+    def clear_library_selection(self):
+        self._selected_entry_ids.clear()
+        self._selection_anchor = None
+        self._refresh_library_selection()
+
+    def _selected_library_entries(self):
+        return [entry for entry in self.entries if entry.id in self._selected_entry_ids]
+
+    def show_library_batch_menu(self, position=None):
+        entries = self._selected_library_entries()
+        if not entries:
+            return
+        menu = QMenu(self)
+        identities = [entry.id for entry in entries]
+        menu.addAction(self.tr("添加所选到队列"), lambda: self.queue_library_entries(identities))
+        menu.addAction(self.tr("复制所选"), lambda: self.copy_library_entries(identities))
+        add = menu.addAction(self.tr("加入专辑…"), lambda: self.choose_album_for_entries(identities))
+        add.setEnabled(all(entry.kind == "single" for entry in entries))
+        menu.addSeparator()
+        menu.addAction(self.tr("删除所选"), lambda: self.delete_library_entries(identities))
+        menu.exec(position if position is not None else self.cursor().pos())
+        menu.deleteLater()
+
+    def queue_library_entries(self, identities):
+        # Resolve sequentially so queue ordering matches the selected card order.
+        pending = list(identities)
+        epoch = self._queue_epoch
+        def append_next():
+            if self._closing or epoch != self._queue_epoch or not pending:
+                return
+            entry = self._find(pending.pop(0))
+            if entry is None:
+                append_next()
+                return
+            def ready(current):
+                if epoch != self._queue_epoch:
+                    return
+                if self._find(current.id) is not None:
+                    self._append_tracks(copy_tracks(current.tracks))
+                append_next()
+            self._ensure_entry(entry, ready, lambda message: (self._error(message), append_next()))
+        append_next()
+
+    def choose_album_for_entries(self, identities):
+        albums = [entry for entry in self.entries if entry.kind == "album"]
+        if not albums:
+            self._error(self.tr("还没有专辑，请先新建一个。"))
+            return
+        choices = [f"{index + 1}. {entry.title}" for index, entry in enumerate(albums)]
+        chosen, accepted = QInputDialog.getItem(self, self.tr("加入专辑"), self.tr("请选择专辑"), choices, 0, False)
+        if accepted:
+            album = albums[choices.index(chosen)]
+            for identity in identities:
+                song = self._find(identity)
+                if song is not None and song.kind == "single":
+                    self.add_single_to_album(song, album)
+
+    def copy_library_entries(self, identities):
+        self._normalize_library()
+        copied = copy_entries(self.entries, identities)
+        if not copied:
+            return []
+        self.entries.extend(copied)
+        self._normalize_library()
+        self._render_library()
+        saved = self._save()
+        self.libraryChanged.emit()
+        if saved:
+            self._status("已复制 {count} 项", count=len(identities))
+        return copied
+
+    def batch_queue_tracks(self, album_id, song_ids):
+        album = self._find(album_id)
+        if album is None or album.kind != "album":
+            return
+        selected = set(song_ids)
+        self._append_tracks(copy_tracks([track for track in album.tracks if (track.song_id or track.id) in selected]))
+
+    def batch_copy_tracks(self, album_id, song_ids):
+        album = self._find(album_id)
+        if album is None or album.kind != "album":
+            return
+        selected = set(song_ids)
+        identities = [track.song_id or track.id for track in album.tracks if (track.song_id or track.id) in selected]
+        copied = copy_entries(self.entries, identities)
+        self.entries.extend(copied)
+        album.tracks.extend(entry.tracks[0] for entry in copied if entry.kind == "single" and entry.tracks)
+        self._normalize_library()
+        self._render_library()
+        self._save()
+        self.libraryChanged.emit()
+
+    def batch_remove_album_tracks(self, album_id, song_ids):
+        album = self._find(album_id)
+        if album is None or album.kind != "album":
+            return
+        selected = set(song_ids)
+        album.tracks[:] = [track for track in album.tracks if (track.song_id or track.id) not in selected]
+        self._render_library()
+        self._save()
+        self.libraryChanged.emit()
 
     def swap_library_entries(self, source_id: str, target_id: str):
         if source_id == target_id:
@@ -1030,7 +1197,12 @@ class MainWindow(QMainWindow):
 
     def commit_list_import(self, result):
         album = replace(result.album, tracks=list(result.album.tracks))
+        for song in result.songs:
+            if song.tracks:
+                song.tracks[0].id = song.id
+                song.tracks[0].song_id = song.id
         self.entries.append(album)
+        self.entries.extend(result.songs)
         self._normalize_library()
         self._render_library()
         if not self._save():
@@ -1094,9 +1266,6 @@ class MainWindow(QMainWindow):
         if song is None:
             self._normalize_library()
             song = find_song(self.entries, track.song_id or track.id)
-        if song is None:
-            song = next((e for e in self.entries if e.kind == "single" and
-                         (e.bvid, e.page) == (track.bvid, track.page)), None)
         return song
 
     def _find(self, identity: str):
@@ -1257,11 +1426,6 @@ class MainWindow(QMainWindow):
         song = self._find(current.id)
         if song is None or song.kind != "single":
             return
-        collision = next((e for e in self.entries if e.kind == "single" and e.id != song.id and
-                          (e.bvid, e.page) == (updated.bvid, updated.page)), None)
-        if collision is not None:
-            self._error(self.tr("该视频分 P 已有单曲，请直接编辑已有歌曲。"))
-            return
         canonical = song.tracks[0] if song.tracks else None
         if updated.tracks:
             candidate = updated.tracks[0]
@@ -1313,11 +1477,6 @@ class MainWindow(QMainWindow):
         self._song_edit_requests[current.id] = revision
         updated.kind = "single"
         if (updated.bvid, updated.page) != (current.bvid, current.page):
-            conflict = next((song for song in self.entries if song.kind == "single" and song.id != current.id
-                             and (song.bvid, song.page) == (updated.bvid, updated.page)), None)
-            if conflict is not None:
-                self._error(self.tr("该视频分 P 已有单曲，请直接编辑已有歌曲。"))
-                return
             # Validate the replacement before changing the shared song entity.
             def loaded(info):
                 if self._song_edit_requests.get(current.id) != revision:
@@ -1332,13 +1491,53 @@ class MainWindow(QMainWindow):
             self._commit_song_edit(current, updated)
 
     def delete_entry(self, entry: LibraryEntry):
-        if entry.kind == "single":
-            delete_song(self.entries, entry.id)
-        else:
-            self.entries = [e for e in self.entries if e.id != entry.id]
+        return self.delete_library_entries([entry.id])
+
+    def _ask_album_deletion(self, albums):
+        message = QMessageBox(self)
+        message.setWindowTitle(self.tr("删除专辑"))
+        message.setIcon(QMessageBox.Icon.Question)
+        message.setText(self.tr("删除 {count} 个专辑时，如何处理其中的单曲？", count=len(albums)))
+        message.setInformativeText(self.tr("保留单曲会将它们移出所选专辑，未属于其他专辑的歌曲会成为无专辑单曲。一并删除会从音乐库及其他专辑中删除这些实体。"))
+        keep = message.addButton(self.tr("保留单曲"), QMessageBox.ButtonRole.AcceptRole)
+        remove = message.addButton(self.tr("一并删除单曲"), QMessageBox.ButtonRole.DestructiveRole)
+        message.addButton(QMessageBox.StandardButton.Cancel)
+        message.setDefaultButton(keep)
+        message.exec()
+        if message.clickedButton() == keep:
+            return "keep"
+        if message.clickedButton() == remove:
+            return "delete"
+        return None
+
+    def delete_library_entries(self, identities, album_contents=None):
+        self._normalize_library()
+        selected = [entry for entry in self.entries if entry.id in set(identities)]
+        albums = [entry for entry in selected if entry.kind == "album"]
+        if albums and album_contents is None:
+            album_contents = self._ask_album_deletion(albums)
+            if album_contents is None:
+                return False
+        if album_contents not in (None, "keep", "delete"):
+            return False
+        song_ids = {entry.id for entry in selected if entry.kind == "single"}
+        if album_contents == "delete":
+            song_ids.update(track.song_id or track.id for album in albums for track in album.tracks)
+        for identity in song_ids:
+            delete_song(self.entries, identity)
+        album_ids = {entry.id for entry in albums}
+        self.entries[:] = [entry for entry in self.entries if entry.id not in album_ids]
+        # Queue occurrences are snapshots: unlink deleted entities to avoid future cross-updates.
+        for index in range(self.queue.count()):
+            item = self.queue.item(index)
+            track = item.data(Qt.ItemDataRole.UserRole)
+            if track.song_id in song_ids:
+                track.song_id = ""
+                item.setData(Qt.ItemDataRole.UserRole, track)
         self._render_library()
         self._save()
         self.libraryChanged.emit()
+        return True
 
     def _build_entry_menu(self, entry):
         menu = QMenu(self)
@@ -1354,6 +1553,8 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         action("details", "打开专辑" if entry.kind == "album" else "打开单曲详情", lambda: self.open_entry(entry))
         action("edit", "编辑专辑" if entry.kind == "album" else "编辑", lambda: self.open_album(entry) if entry.kind == "album" else self.edit_single(entry))
+        action("select", "多选", lambda: self.enter_library_selection(entry.id))
+        action("copy", "复制", lambda: self.copy_library_entries([entry.id]))
         if entry.kind == "single":
             action("add_album", "加入专辑…", lambda: self._choose_album(entry))
         web = action("source", "在 B站打开", lambda: QDesktopServices.openUrl(QUrl(f"https://www.bilibili.com/video/{entry.bvid}/")))
@@ -1363,6 +1564,9 @@ class MainWindow(QMainWindow):
         return menu
 
     def _entry_menu(self, entry, position=None):
+        if entry.id in self._selected_entry_ids and len(self._selected_entry_ids) > 1:
+            self.show_library_batch_menu(position)
+            return
         menu = self._build_entry_menu(entry)
         try:
             menu.exec(position if position is not None else self.cursor().pos())
@@ -1610,23 +1814,33 @@ class MainWindow(QMainWindow):
         if chosen == play:
             self.play_item(item)
         elif chosen == remove:
-            row = self.queue.row(item)
-            is_current = item.data(Qt.ItemDataRole.UserRole).id == self.current_id
+            selected = self.queue.selectedItems() if item.isSelected() else [item]
+            self.remove_queue_items(selected)
+        menu.deleteLater()
+
+    def remove_queue_items(self, items):
+        if not items:
+            return
+        rows = sorted({self.queue.row(item) for item in items if self.queue.row(item) >= 0})
+        if not rows:
+            return
+        is_current = any(self.queue.item(row).data(Qt.ItemDataRole.UserRole).id == self.current_id for row in rows)
+        for row in reversed(rows):
             self.queue.takeItem(row)
-            if is_current:
-                self._reset_playback_recovery()
-                self._request += 1
-                self.player.stop()
-                self.player.setSource(QUrl())
-                self.current_id = None
-                if self.queue.count():
-                    self.play_item(self.queue.item(min(row, self.queue.count() - 1)))
-                else:
-                    self.now_title.setText(self.tr("还没有正在播放的音乐"))
-                    self.now_meta.setText(self.tr("从音乐库点击播放"))
-                    self._sync_mini_text()
-                    self._update_current_cover()
-            self._queue_changed()
+        if is_current:
+            self._reset_playback_recovery()
+            self._request += 1
+            self.player.stop()
+            self.player.setSource(QUrl())
+            self.current_id = None
+            if self.queue.count():
+                self.play_item(self.queue.item(min(rows[0], self.queue.count() - 1)))
+            else:
+                self.now_title.setText(self.tr("还没有正在播放的音乐"))
+                self.now_meta.setText(self.tr("从音乐库点击播放"))
+                self._sync_mini_text()
+                self._update_current_cover()
+        self._queue_changed()
 
     def _seek_to(self, position: int):
         position = max(0, min(position, self.seek.maximum()))

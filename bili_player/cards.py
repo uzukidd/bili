@@ -5,7 +5,7 @@ from PyQt6 import sip
 from PyQt6.QtCore import QEvent, QMimeData, QPoint, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QDrag, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import (
-    QAbstractButton, QApplication, QFrame, QGridLayout, QLabel, QLayout,
+    QAbstractButton, QApplication, QCheckBox, QFrame, QGridLayout, QLabel, QLayout,
     QPushButton, QSizePolicy, QWidget,
 )
 
@@ -111,6 +111,7 @@ class LibraryCard(QFrame):
     openRequested = pyqtSignal(str)
     playRequested = pyqtSignal(str)
     menuRequested = pyqtSignal(str, QPoint)
+    selectionRequested = pyqtSignal(str, object)
 
     def __init__(self, entry_id: str, drag_group: str, drag_hint: str, parent=None):
         super().__init__(parent)
@@ -127,6 +128,11 @@ class LibraryCard(QFrame):
         self._keyboard_focus = False
         self._scale = 1.0
         self.artwork = None
+        self.selection_mode = False
+        self.selection_box = QCheckBox(self)
+        self.selection_box.setFixedSize(26, 26)
+        self.selection_box.hide()
+        self.selection_box.clicked.connect(lambda: self.selectionRequested.emit(self.entry_id, Qt.KeyboardModifier.ControlModifier))
         self.title_label = None
         self.subtitle_label = None
         self.play_button = HoverPlayButton(self)
@@ -139,7 +145,8 @@ class LibraryCard(QFrame):
         self.artwork = artwork
         self.play_button.theme = artwork.theme
         artwork.setParent(self)
-        artwork.clicked.connect(lambda: self.openRequested.emit(self.entry_id))
+        artwork.clicked.connect(lambda: self.selectionRequested.emit(self.entry_id, Qt.KeyboardModifier.ControlModifier)
+                                if self.selection_mode else self.openRequested.emit(self.entry_id))
         self.title_label = ElidedLabel(title, self)
         self.title_label.setObjectName("cardTitle")
         self.subtitle_label = ElidedLabel(subtitle, self)
@@ -177,6 +184,17 @@ class LibraryCard(QFrame):
         self.play_button.move(max(0, side - self.play_button.width() - inset),
                               max(0, side - self.play_button.height() - inset))
         self.play_button.raise_()
+        self.selection_box.move(padding + 5, padding + 5)
+        self.selection_box.raise_()
+
+    def set_selection(self, enabled: bool, selected: bool):
+        self.selection_mode = enabled
+        self.selection_box.setVisible(enabled)
+        self.selection_box.setChecked(selected)
+        self.setProperty("selected", selected)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -212,6 +230,12 @@ class LibraryCard(QFrame):
         if watched not in self._drag_widgets:
             return super().eventFilter(watched, event)
         if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            modifiers = event.modifiers()
+            if self.selection_mode or modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+                self.selectionRequested.emit(self.entry_id, modifiers)
+                self._press = None
+                event.accept()
+                return True
             self._press = event.globalPosition().toPoint()
             self._dragged = False
         elif event.type() == QEvent.Type.MouseMove and self._press is not None:

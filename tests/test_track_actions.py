@@ -168,10 +168,10 @@ class TrackActionTests(unittest.TestCase):
         self.assertIs(queue.currentItem(), queue.item(1))
         self.assertEqual(len(self.window._tracks()), 4)
 
-    def test_track_actions_use_same_canonical_song_across_folders_without_duplicates(self):
+    def test_track_actions_use_explicit_song_references_across_folders_and_keep_source_duplicates(self):
         second = LibraryEntry("Second folder", kind="album", resolved=True,
-                              tracks=[replace(self.source, id="second-folder-copy", song_id="")])
-        duplicate = replace(self.song, id="duplicate-single", tracks=[replace(self.source)])
+                              tracks=[replace(self.source, id="second-folder-reference")])
+        duplicate = replace(self.song, id="duplicate-single", tracks=[replace(self.source, song_id="duplicate-single")])
         self.window.entries.extend([second, duplicate])
         self.window._normalize_library()
         self.queued_tracks()
@@ -192,7 +192,7 @@ class TrackActionTests(unittest.TestCase):
                     editor.reset_mock()
             folder_editor.assert_not_called()
         self.assertEqual([entry for entry in self.window.entries if entry.kind == "single"],
-                         [self.song])
+                         [self.song, duplicate])
         self.assertIs(self.album.tracks[0], self.song.tracks[0])
         self.assertIs(second.tracks[0], self.song.tracks[0])
         self.assertEqual(self.window.entries, before)
