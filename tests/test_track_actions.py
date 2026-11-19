@@ -102,8 +102,8 @@ class TrackActionTests(unittest.TestCase):
         self.assertIsNot(second, first)
         self.assertEqual(replace(first, id=self.source.id), self.source)
         self.assertEqual(replace(second, id=self.source.id), self.source)
-        self.assertEqual(first_item.text(), "Album-local title\nP2 · Local artist")
-        self.assertEqual(first_item.toolTip(), f"Album-local title\n{BV} · P2")
+        self.assertEqual(first_item.text(), "Album-local title\nLocal artist")
+        self.assertEqual(first_item.toolTip(), first_item.text())
         first.title = "Queue-only edit"
         self.assertEqual(asdict(self.source), original)
         self.assertEqual(second.title, original["title"])
@@ -124,13 +124,14 @@ class TrackActionTests(unittest.TestCase):
                 self.assertEqual(self.window.current_id, current_id)
         self.assertEqual([track.id for track in self.window._tracks()[:3]], [t.id for t in tracks])
 
-    def test_empty_queue_insert_keeps_no_selection_and_uses_bvid_when_artist_missing(self):
+    def test_empty_queue_insert_keeps_no_selection_and_only_shows_title_without_artist(self):
         track = replace(self.source, artist="")
         item = self.window.insert_track_next(track)
         self.assertIs(self.window.queue.item(0), item)
         self.assertIsNone(self.window.queue.currentItem())
         self.assertIsNone(self.window.current_id)
-        self.assertEqual(item.text(), f"Album-local title\nP2 · {BV}")
+        self.assertEqual(item.text(), "Album-local title")
+        self.assertEqual(item.toolTip(), "Album-local title")
         self.assertEqual(self.window._request, 0)
         self.assertFalse(self.window._want_playing)
 

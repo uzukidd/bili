@@ -14,7 +14,7 @@ from PyQt6.QtCore import (
     QTimer, QTranslator, Qt, QUrl, QSize, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QShortcut,
+    QColor, QDesktopServices, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QShortcut,
 )
 from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PyQt6.QtWidgets import (
@@ -34,7 +34,8 @@ from .dialogs import AlbumDialog, EntryDialog
 from .exchange import read_library, write_library
 from .i18n import translate, translate_error
 from .list_dialog import ListImportDialog
-from .models import LibraryEntry, Store, Track
+from .mini_cover import CoverButton
+from .models import DEFAULT_MINI_COVER_STYLE, MINI_COVER_STYLES, LibraryEntry, Store, Track
 from .playback_order import ShuffleOrder
 from .window_chrome import TitleBar, FramelessController
 from .stream import StreamProxy
@@ -167,51 +168,6 @@ def media_icon(kind: str, theme: str, primary: bool = False) -> QIcon:
     return QIcon(pixmap)
 
 
-class CoverButton(QPushButton):
-    def __init__(self, caption: str, theme: str, parent=None):
-        super().__init__(parent)
-        self.caption = caption
-        self.theme = theme
-        self.pixmap = QPixmap()
-        self.setFixedHeight(130)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setAccessibleName(caption)
-
-    def set_pixmap(self, pixmap: QPixmap):
-        self.pixmap = pixmap
-        self.update()
-
-    def paintEvent(self, _event):
-        p = PALETTES[self.theme]
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = QRectF(self.rect())
-        clip = QPainterPath()
-        clip.addRoundedRect(rect, 9, 9)
-        painter.setClipPath(clip)
-        painter.fillRect(rect, QColor(p["art"]))
-        if not self.pixmap.isNull():
-            image = self.pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                                       Qt.TransformationMode.SmoothTransformation)
-            painter.drawPixmap((self.width() - image.width()) // 2,
-                               (self.height() - image.height()) // 2, image)
-            if self.caption:
-                painter.fillRect(0, self.height() - 33, self.width(), 33, QColor(0, 0, 0, 125))
-                painter.setPen(QColor("#ffffff"))
-                painter.drawText(self.rect().adjusted(12, 0, -12, -7),
-                                 Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft, self.caption)
-        else:
-            painter.setPen(QColor(p["accent"]))
-            font = QFont(self.font())
-            font.setPointSize(18)
-            font.setBold(True)
-            painter.setFont(font)
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "♫  " + self.caption)
-        if self.hasFocus():
-            painter.setPen(QColor(p["accent"]))
-            painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 8, 8)
-
-
 class PlayerPages(QStackedWidget):
     def minimumSizeHint(self):
         return QSize(0, 0)
@@ -243,6 +199,7 @@ class MainWindow(QMainWindow):
             load_error = str(exc)
         self.theme = self.store.settings["theme"]
         self.language = self.store.settings["language"]
+        self.mini_cover_style = self.store.settings.get("mini_cover_style", DEFAULT_MINI_COVER_STYLE)
         self.audio_output_id = self.store.settings.get("audio_output_id", "")
         self._settings_dialog: SettingsDialog | None = None
         self._clearing_audio_cache = False
@@ -537,9 +494,9 @@ class MainWindow(QMainWindow):
         self._bind(self.expand_button, "返回完整播放器", "setToolTip")
         header.addWidget(self.expand_button)
         layout.addLayout(header)
-        self.mini_cover = CoverButton("", self.theme)
+        self.mini_cover = CoverButton(self.theme)
+        self.mini_cover.set_cover_style(self.mini_cover_style)
         self.mini_cover.setMinimumSize(240, 240)
-        self.mini_cover.setMaximumHeight(16777215)
         self.mini_cover.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.mini_cover.clicked.connect(self.toggle_play)
         self._bind(self.mini_cover, "播放 / 暂停（空格）", "setToolTip")
@@ -763,7 +720,10 @@ class MainWindow(QMainWindow):
     def _sync_mini_text(self):
         self.mini_title.setText(self.now_title.text())
         self.mini_title.setToolTip(self.now_title.text())
-        self.mini_meta.setText(self.now_meta.text())
+        artist = self.now_meta.text()
+        self.now_meta.setVisible(bool(artist))
+        self.mini_meta.setText(artist)
+        self.mini_meta.setVisible(bool(artist))
         self.mini_cover.setAccessibleName(self.now_title.text())
         self.tray.setToolTip(("Bili Music · " + self.now_title.text())[:127])
 
@@ -1149,6 +1109,15 @@ class MainWindow(QMainWindow):
             if not sip.isdeleted(dialog):
                 dialog.deleteLater()
 
+    def set_mini_cover_style(self, style: str):
+        if style not in MINI_COVER_STYLES or style == self.mini_cover_style:
+            return
+        self.mini_cover_style = style
+        self.mini_cover.set_cover_style(style)
+        if self._settings_dialog is not None:
+            self._settings_dialog.refresh_mini_cover()
+        self._save()
+
     def _refresh_settings(self):
         if self._settings_dialog is not None:
             self._settings_dialog.refresh_preferences()
@@ -1462,6 +1431,7 @@ class MainWindow(QMainWindow):
             song = self.song_for_track(track, album)
             members.append(song.tracks[0] if song and song.tracks else track)
         current.title, current.cover = album.title, album.cover
+        current.artist, current.date = album.artist, album.date
         current.tracks = members
         current.resolved = True
         self._normalize_library()
@@ -1537,12 +1507,10 @@ class MainWindow(QMainWindow):
             queued = item.data(Qt.ItemDataRole.UserRole)
             if queued.song_id == song.id:
                 queued = replace(canonical, id=queued.id, song_id=song.id)
-                item.setData(Qt.ItemDataRole.UserRole, queued)
-                item.setText(f"{queued.title}\nP{queued.page} · {queued.artist or queued.bvid}")
-                item.setToolTip(f"{queued.title}\n{queued.bvid} · P{queued.page}")
+                self._set_queue_item_track(item, queued)
                 if queued.id == self.current_id:
                     self.now_title.setText(song.title)
-                    self.now_meta.setText(f"{song.artist or song.bvid} · P{song.page}")
+                    self.now_meta.setText(queued.artist.strip())
                     self._sync_mini_text()
                     self._update_current_cover(queued)
 
@@ -1555,6 +1523,12 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         updated = dialog.value()
+        if updated.cover and updated.cover != current.cover and not updated.cover.startswith(("http://", "https://")):
+            try:
+                updated.cover = str(self.covers.fetch(updated.cover))
+            except (OSError, ValueError) as exc:
+                self._error(str(exc))
+                return
         revision = self._song_edit_requests.get(current.id, 0) + 1
         self._song_edit_requests[current.id] = revision
         updated.kind = "single"
@@ -1564,7 +1538,7 @@ class MainWindow(QMainWindow):
                 if self._song_edit_requests.get(current.id) != revision:
                     return
                 updated.tracks = info.tracks
-                updated.cover = info.cover
+                updated.cover = updated.cover or info.cover
                 updated.resolved = True
                 self._commit_song_edit(current, updated)
             self._submit(lambda: BilibiliClient().get_video(updated), loaded)
@@ -1714,19 +1688,25 @@ class MainWindow(QMainWindow):
             self._append_tracks(copy_tracks(missing))
         return len(missing)
 
+    @staticmethod
+    def _set_queue_item_track(item: QListWidgetItem, track: Track):
+        artist = track.artist.strip()
+        text = f"{track.title}\n{artist}" if artist else track.title
+        item.setData(Qt.ItemDataRole.UserRole, track)
+        item.setText(text)
+        item.setToolTip(text)
+
     def _append_tracks(self, tracks: list[Track], persist=True):
         for track in tracks:
-            item = QListWidgetItem(f"{track.title}\nP{track.page} · {track.artist or track.bvid}")
-            item.setData(Qt.ItemDataRole.UserRole, track)
-            item.setToolTip(f"{track.title}\n{track.bvid} · P{track.page}")
+            item = QListWidgetItem()
+            self._set_queue_item_track(item, track)
             self.queue.addItem(item)
         self._queue_changed(persist=persist)
 
     def insert_track_next(self, track: Track) -> QListWidgetItem:
         queued = replace(track, id=str(uuid4()), song_id=track.song_id or track.id)
-        item = QListWidgetItem(f"{queued.title}\nP{queued.page} · {queued.artist or queued.bvid}")
-        item.setData(Qt.ItemDataRole.UserRole, queued)
-        item.setToolTip(f"{queued.title}\n{queued.bvid} · P{queued.page}")
+        item = QListWidgetItem()
+        self._set_queue_item_track(item, queued)
         row = self._current_row()
         self.queue.insertItem(row + 1 if row >= 0 else self.queue.count(), item)
         self._play_next_priority.insert(0, queued.id)
@@ -1764,7 +1744,7 @@ class MainWindow(QMainWindow):
         self.shuffle_order.record(track.id)
         self.queue.setCurrentItem(item)
         self.now_title.setText(track.title)
-        self.now_meta.setText(f"{track.artist or track.bvid} · P{track.page}")
+        self.now_meta.setText(track.artist.strip())
         self._sync_mini_text()
         self._update_current_cover(track)
         self._status("正在获取音频地址…")
@@ -1998,6 +1978,7 @@ class MainWindow(QMainWindow):
             total.setText(timestamp(duration))
 
     def _playback_state(self, state):
+        self.mini_cover.set_playing(state == QMediaPlayer.PlaybackState.PlayingState)
         for widget in (self.play_button, self.mini_play):
             widget.setIcon(media_icon(
                 "pause" if state == QMediaPlayer.PlaybackState.PlayingState else "play", self.theme, primary=True,
@@ -2036,7 +2017,8 @@ class MainWindow(QMainWindow):
             self._normalize_library()
             self.store.save(self.entries, self._tracks(), self.volume.value(),
                             {"theme": self.theme, "language": self.language, "card_scale": self.card_scale,
-                             "play_mode": self.mode.currentIndex(), "audio_output_id": self.audio_output_id})
+                             "play_mode": self.mode.currentIndex(), "audio_output_id": self.audio_output_id,
+                             "mini_cover_style": self.mini_cover_style})
             return True
         except (ValueError, OSError) as exc:
             self._status("保存失败：{message}", message=translate_error(str(exc), self.language))

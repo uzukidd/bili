@@ -1,8 +1,12 @@
-from PyQt6.QtCore import QSignalBlocker, Qt
+from PyQt6.QtCore import QSize, QSignalBlocker, Qt
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
-    QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QPushButton,
-    QSizePolicy, QVBoxLayout,
+    QButtonGroup, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
+    QPushButton, QSizePolicy, QToolButton, QVBoxLayout,
 )
+
+from .mini_cover import mini_cover_preview
+from .models import MINI_COVER_STYLES
 
 
 class SettingsDialog(QDialog):
@@ -33,6 +37,26 @@ class SettingsDialog(QDialog):
         layout.addLayout(form)
         self.output_hint = self._muted_label()
         layout.addWidget(self.output_hint)
+
+        self.mini_cover_label = QLabel()
+        self.mini_cover_label.setObjectName("section")
+        layout.addWidget(self.mini_cover_label)
+        previews = QHBoxLayout()
+        self.mini_cover_group = QButtonGroup(self)
+        self.mini_cover_buttons = {}
+        for style in MINI_COVER_STYLES:
+            preview = QToolButton()
+            preview.setObjectName("miniCoverOption")
+            preview.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            preview.setIconSize(QSize(128, 112))
+            preview.setCheckable(True)
+            preview.setCursor(Qt.CursorShape.PointingHandCursor)
+            preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            preview.clicked.connect(lambda checked, style=style: owner.set_mini_cover_style(style))
+            self.mini_cover_group.addButton(preview)
+            self.mini_cover_buttons[style] = preview
+            previews.addWidget(preview, 1)
+        layout.addLayout(previews)
 
         cache_panel = QFrame()
         cache_panel.setObjectName("queuePanel")
@@ -83,6 +107,15 @@ class SettingsDialog(QDialog):
         self.theme_combo.setCurrentIndex(self.theme_combo.findData(self.owner.theme))
         self.language_combo.setCurrentIndex(self.language_combo.findData(self.owner.language))
         self.close_button.setText(tr("关闭"))
+        self.refresh_mini_cover()
+
+    def refresh_mini_cover(self):
+        self.mini_cover_label.setText(self.owner.tr("迷你播放器样式"))
+        for style, title in zip(MINI_COVER_STYLES, ("经典封面", "圆形唱片")):
+            button = self.mini_cover_buttons[style]
+            button.setText(self.owner.tr(title))
+            button.setIcon(QIcon(mini_cover_preview(style, self.owner.theme, button.devicePixelRatioF())))
+            button.setChecked(style == self.owner.mini_cover_style)
 
     def refresh_outputs(self, devices, default, selected):
         tr = self.owner.tr
