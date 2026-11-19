@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 from bili_player.api import BilibiliClient
 from bili_player.app import MainWindow, copy_tracks
 from bili_player.models import LibraryEntry, Track
+from bili_player.settings_dialog import SettingsDialog
 from tests.test_player import AudioFixture
 
 BV = "BV1xx411c7mD"
@@ -126,11 +127,13 @@ class AudioCacheUITests(unittest.TestCase):
             clear.assert_not_called()
         jobs = []
         self.window._submit = lambda fn, done, error=None: jobs.append((fn, done, error))
+        self.window._settings_dialog = SettingsDialog(self.window)
+        self.window._refresh_settings()
         with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
-            self.window.clear_audio_cache()
-        self.assertFalse(self.window.cache_button.isEnabled())
+            self.window._settings_dialog.clear_cache_button.click()
+        self.assertFalse(self.window._settings_dialog.clear_cache_button.isEnabled())
         jobs[0][1]({"removed_bytes": 1024 ** 2, "pending_bytes": 2 * 1024 ** 2})
-        self.assertTrue(self.window.cache_button.isEnabled())
+        self.assertTrue(self.window._settings_dialog.clear_cache_button.isEnabled())
         self.assertIn("1.0", self.window.status.text())
         self.assertIn("2.0", self.window.status.text())
         self.assertEqual([entry.id for entry in self.window.entries], ids)
@@ -140,11 +143,13 @@ class AudioCacheUITests(unittest.TestCase):
         jobs = []
         self.window._submit = lambda fn, done, error=None: jobs.append((fn, done, error))
         self.window.set_language("en_US")
+        self.window._settings_dialog = SettingsDialog(self.window)
+        self.window._refresh_settings()
         with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
-            self.window.clear_audio_cache()
+            self.window._settings_dialog.clear_cache_button.click()
         jobs[0][2]("Disk unavailable")
-        self.assertTrue(self.window.cache_button.isEnabled())
-        self.assertEqual(self.window.cache_button.text(), "Cache")
+        self.assertTrue(self.window._settings_dialog.clear_cache_button.isEnabled())
+        self.assertEqual(self.window._settings_dialog.clear_cache_button.text(), "Clear audio cache…")
         self.assertIn("Could not clear audio cache", self.window._error.call_args.args[0])
 
     def test_clear_queue_releases_active_cache(self):

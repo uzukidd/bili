@@ -16,7 +16,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QShortcut,
 )
-from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -38,6 +38,7 @@ from .models import LibraryEntry, Store, Track
 from .playback_order import ShuffleOrder
 from .window_chrome import TitleBar, FramelessController
 from .stream import StreamProxy
+from .settings_dialog import SettingsDialog
 from .widgets import PlaybackTitleLabel, SeekSlider
 from .theme import PALETTES, apply_theme, stylesheet
 
@@ -242,6 +243,9 @@ class MainWindow(QMainWindow):
             load_error = str(exc)
         self.theme = self.store.settings["theme"]
         self.language = self.store.settings["language"]
+        self.audio_output_id = self.store.settings.get("audio_output_id", "")
+        self._settings_dialog: SettingsDialog | None = None
+        self._clearing_audio_cache = False
         self.card_scale = float(self.store.settings.get("card_scale", 1.0))
         self._saved_play_mode = self.store.settings.get("play_mode", 0)
         self.shuffle_order = ShuffleOrder()
@@ -287,6 +291,9 @@ class MainWindow(QMainWindow):
         self.audio.setVolume(volume / 100)
         self.player = QMediaPlayer(self)
         self.player.setAudioOutput(self.audio)
+        self.media_devices = QMediaDevices(self)
+        self.media_devices.audioOutputsChanged.connect(self._sync_audio_output)
+        self._sync_audio_output()
         apply_theme(QApplication.instance(), self.theme)
         self._build(volume)
         self._build_mini()
@@ -353,22 +360,8 @@ class MainWindow(QMainWindow):
         header.addSpacing(12)
         header.addWidget(self._text("Basic Integrated Listening Infrastructure", "muted"))
         header.addStretch()
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItem("", "light")
-        self.theme_combo.addItem("", "dark")
-        self.theme_combo.setCurrentIndex(1 if self.theme == "dark" else 0)
-        self._bind(self.theme_combo, "主题", "setToolTip")
-        self.theme_combo.currentIndexChanged.connect(lambda: self.set_theme(self.theme_combo.currentData()))
-        header.addWidget(self.theme_combo)
-        self.language_combo = QComboBox()
-        self.language_combo.addItem("简体中文", "zh_CN")
-        self.language_combo.addItem("English", "en_US")
-        self.language_combo.setCurrentIndex(1 if self.language == "en_US" else 0)
-        self._bind(self.language_combo, "语言", "setToolTip")
-        self.language_combo.currentIndexChanged.connect(lambda: self.set_language(self.language_combo.currentData()))
-        header.addWidget(self.language_combo)
-        self.cache_button = self._button("缓存", self.show_audio_cache_menu)
-        header.addWidget(self.cache_button)
+        self.settings_button = self._button("设置", self.open_settings)
+        header.addWidget(self.settings_button)
         self.pin_button = self._make_pin_button()
         header.addWidget(self.pin_button)
         self.collapse_button = self._button("折叠", lambda: self.set_mini_mode(True))
@@ -850,8 +843,7 @@ class MainWindow(QMainWindow):
             self.mode.setItemText(index, self.tr(text))
         self.title_bar.set_language(self.language)
         self._refresh_mode_button()
-        for index, text in enumerate(("白天模式", "夜晚模式")):
-            self.theme_combo.setItemText(index, self.tr(text))
+        self._refresh_settings()
         if self.current_id is None:
             self.now_title.setText(self.tr("还没有正在播放的音乐"))
             self.now_meta.setText(self.tr("从音乐库点击播放"))
@@ -865,9 +857,8 @@ class MainWindow(QMainWindow):
         if theme == self.theme:
             return
         self.theme = theme
-        self.theme_combo.blockSignals(True)
-        self.theme_combo.setCurrentIndex(self.theme_combo.findData(theme))
-        self.theme_combo.blockSignals(False)
+        if self._settings_dialog is not None:
+            self._settings_dialog.refresh_preferences()
         apply_theme(QApplication.instance(), theme)
         self.previous_button.setIcon(media_icon("previous", self.theme))
         self.next_button.setIcon(media_icon("next", self.theme))
@@ -887,9 +878,6 @@ class MainWindow(QMainWindow):
         if language == self.language:
             return
         self.language = language
-        self.language_combo.blockSignals(True)
-        self.language_combo.setCurrentIndex(self.language_combo.findData(language))
-        self.language_combo.blockSignals(False)
         self._retranslate()
         self._save()
 
@@ -1148,45 +1136,76 @@ class MainWindow(QMainWindow):
 
         self._submit(lambda: self.covers.fetch(source), done, failed)
 
-    def show_audio_cache_menu(self):
+    def open_settings(self):
+        if self._settings_dialog is not None:
+            return
+        dialog = SettingsDialog(self)
+        self._settings_dialog = dialog
+        try:
+            self._refresh_settings()
+            dialog.exec()
+        finally:
+            self._settings_dialog = None
+            if not sip.isdeleted(dialog):
+                dialog.deleteLater()
+
+    def _refresh_settings(self):
+        if self._settings_dialog is not None:
+            self._settings_dialog.refresh_preferences()
+            self._sync_audio_output()
+            self._refresh_cache_settings()
+
+    def _sync_audio_output(self):
+        if self._closing:
+            return
+        devices = self.media_devices.audioOutputs()
+        default = self.media_devices.defaultAudioOutput()
+        selected = next((device for device in devices
+                         if bytes(device.id()).hex() == self.audio_output_id), default)
+        if not selected.isNull() and selected != self.audio.device():
+            self.audio.setDevice(selected)
+        if self._settings_dialog is not None:
+            self._settings_dialog.refresh_outputs(devices, default, self.audio_output_id)
+
+    def set_audio_output(self, device_id: str):
+        if self.audio_output_id == device_id:
+            return
+        self.audio_output_id = device_id
+        self._sync_audio_output()
+        self._save()
+
+    def _refresh_cache_settings(self):
+        if self._settings_dialog is None:
+            return
         try:
             info = self.proxy.cache_info()
-        except OSError as exc:
-            self._error(self.tr("无法读取音频缓存：{message}", message=str(exc)))
-            return
-        menu = QMenu(self)
-        summary = menu.addAction(self.tr("音频缓存：{size} MiB · {count} 首",
-                                         size=f"{info['bytes'] / 1024 ** 2:.1f}", count=info['entries']))
-        summary.setEnabled(False)
-        policy = menu.addAction(self.tr("上限 1 GiB，超限优先清理最久未使用的缓存"))
-        policy.setEnabled(False)
-        menu.addSeparator()
-        clear = menu.addAction(self.tr("清除音频缓存…"), self.clear_audio_cache)
-        clear.setEnabled(self.cache_button.isEnabled())
-        try:
-            menu.exec(self.cache_button.mapToGlobal(self.cache_button.rect().bottomLeft()))
-        finally:
-            menu.deleteLater()
+        except OSError:
+            info = None
+        self._settings_dialog.refresh_cache(info, self._clearing_audio_cache)
 
     def clear_audio_cache(self):
-        if not self.cache_button.isEnabled():
+        if self._clearing_audio_cache:
             return
         answer = QMessageBox.question(
-            self, self.tr("清除音频缓存"),
+            self._dialog_host(), self.tr("清除音频缓存"),
             self.tr("清除已下载的音频缓存？音乐库和封面会保留；正在使用的缓存将在切歌或退出后清理。"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.cache_button.setEnabled(False)
+        self._clearing_audio_cache = True
+        self._refresh_cache_settings()
+
         def done(result):
-            self.cache_button.setEnabled(True)
+            self._clearing_audio_cache = False
+            self._refresh_cache_settings()
             self._status("已清除 {size} MiB 音频缓存 · 待释放 {pending} MiB",
                          size=f"{result['removed_bytes'] / 1024 ** 2:.1f}",
                          pending=f"{result['pending_bytes'] / 1024 ** 2:.1f}")
         def failed(message):
-            self.cache_button.setEnabled(True)
+            self._clearing_audio_cache = False
+            self._refresh_cache_settings()
             self._error(self.tr("清除音频缓存失败：{message}", message=message))
         self._submit(self.proxy.clear_cache, done, failed)
 
@@ -2017,7 +2036,7 @@ class MainWindow(QMainWindow):
             self._normalize_library()
             self.store.save(self.entries, self._tracks(), self.volume.value(),
                             {"theme": self.theme, "language": self.language, "card_scale": self.card_scale,
-                             "play_mode": self.mode.currentIndex()})
+                             "play_mode": self.mode.currentIndex(), "audio_output_id": self.audio_output_id})
             return True
         except (ValueError, OSError) as exc:
             self._status("保存失败：{message}", message=translate_error(str(exc), self.language))

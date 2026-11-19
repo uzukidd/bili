@@ -121,6 +121,8 @@ class Store:
             value = result["card_scale"]
             if type(value) not in (int, float) or not 0.7 <= value <= 1.6:
                 raise ValueError("卡片缩放必须在 70% 到 160% 之间")
+        if "audio_output_id" in result:
+            _text(result["audio_output_id"], "音频输出设备 ID")
         if "play_mode" in result:
             value = result["play_mode"]
             if type(value) is not int or not 0 <= value <= 3:

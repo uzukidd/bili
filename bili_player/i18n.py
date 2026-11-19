@@ -4,6 +4,14 @@ from __future__ import annotations
 import re
 
 ENGLISH = {
+    "设置": "Settings", "音频输出设备": "Audio output device",
+    "系统默认": "System default", "系统默认 · {device}": "System default · {device}",
+    "已保存设备（当前未连接）": "Saved device (disconnected)",
+    "未检测到音频输出设备": "No audio output devices detected",
+    "已保存的设备不可用，当前使用系统默认设备。": "The saved device is unavailable. Using the system default.",
+    "音频缓存用量暂不可用": "Audio cache usage is unavailable",
+    "待释放 {size} MiB": "{size} MiB pending release",
+    "正在清除音频缓存…": "Clearing audio cache…",
     "缓存": "Cache", "清除音频缓存…": "Clear audio cache…", "清除音频缓存": "Clear audio cache",
     "音频缓存：{size} MiB · {count} 首": "Audio cache: {size} MiB · {count} tracks",
     "上限 1 GiB，超限优先清理最久未使用的缓存": "1 GiB limit; least recently used audio is cleared first",
