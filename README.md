@@ -1,6 +1,6 @@
 # BILI: Basic Integrated Listening Infrastructure (Bilibili Music Player)
 
-![image-20261119140642179](D:\Workplace\bili\README.assets\image-20261119140642179.png)
+![image-20261119140642179](./README.assets/image-20261119140642179.png)
 
 ## Setup and run
 
@@ -33,4 +33,4 @@ bash scripts/deploy.sh
 
 - Mini music player
 
-  ![image-20261119140311873](D:\Workplace\bili\README.assets\image-20261119140311873.png)
+  ![image-20261119140311873](./README.assets/image-20261119140311873.png)
