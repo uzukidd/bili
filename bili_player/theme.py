@@ -42,6 +42,9 @@ QPushButton[flatIcon="true"]:hover, QPushButton[flatIcon="true"]:checked {
 QPushButton[flatIcon="true"]:checked { color: ACCENT; }
 QPushButton { border: 1px solid LINE; background: PANEL; border-radius: 8px; padding: 8px 12px; }
 QPushButton:hover { background: SOFT; border-color: ACCENT; }
+QToolButton#miniCoverOption { background: PANEL; border: 2px solid LINE; border-radius: 10px; padding: 8px; }
+QToolButton#miniCoverOption:hover, QToolButton#miniCoverOption:focus { border-color: ACCENT; }
+QToolButton#miniCoverOption:checked { background: SOFT; border-color: ACCENT; }
 QPushButton:disabled { color: DISABLED; }
 QPushButton#primary { background: ACCENT; color: #ffffff; border: none; font-weight: 700; }
 QPushButton#primary:hover { background: ACCENT_HOVER; }

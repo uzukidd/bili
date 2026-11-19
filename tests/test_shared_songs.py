@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDialog
 
@@ -76,6 +77,47 @@ class SharedSongTests(unittest.TestCase):
         self.assertIs(folders[0].tracks[0], canonical.tracks[0])
         self.assertIs(folders[1].tracks[0], canonical.tracks[0])
 
+    def test_edit_single_caches_cover_and_refreshes_open_details(self):
+        picture = Path(self.temp.name) / "custom-cover.png"
+        image = QImage(24, 24, QImage.Format.Format_RGB32)
+        image.fill(QColor("#ed7099"))
+        self.assertTrue(image.save(str(picture)))
+        detail = EntryDetailsDialog(self.window, self.song)
+        try:
+            editor = Mock()
+            editor.exec.return_value = QDialog.DialogCode.Accepted
+            editor.value.return_value = replace(self.song, cover=str(picture))
+            with patch("bili_player.app.EntryDialog", return_value=editor):
+                self.window.edit_single(self.song)
+
+            cached = Path(self.song.cover)
+            self.assertEqual(cached.parent, self.window.covers.directory)
+            self.assertEqual(cached.read_bytes(), picture.read_bytes())
+            saved, _, _ = Store(self.window.store.path).load()
+            self.assertEqual(find_song(saved, self.song.id).cover, str(cached))
+            self.window._load_cover.assert_any_call(str(cached), detail.cover_widget)
+        finally:
+            detail.close()
+            detail.deleteLater()
+
+    def test_clearing_artist_updates_current_song_and_queue(self):
+        self.window.resolve_entry(self.song, False)
+        item = self.window.queue.item(0)
+        with patch.object(self.window, "_load_stream"):
+            self.window.play_item(item)
+        self.assertEqual(self.window.now_meta.text(), "Artist")
+        self.assertEqual(self.window.mini_meta.text(), "Artist")
+        self.assertEqual(item.text(), "Song\nArtist")
+
+        updated = replace(self.song, artist="")
+        self.window._commit_song_edit(self.song, updated)
+
+        self.assertEqual(item.text(), "Song")
+        self.assertEqual(item.toolTip(), "Song")
+        for label in (self.window.now_meta, self.window.mini_meta):
+            self.assertEqual(label.text(), "")
+            self.assertTrue(label.isHidden())
+
     def test_open_details_update_when_shared_song_is_saved(self):
         detail = EntryDetailsDialog(self.window, self.song)
         try:
@@ -120,10 +162,21 @@ class SharedSongTests(unittest.TestCase):
         self.song.title = self.song.tracks[0].title = "Latest title"
         self.song.artist = self.song.tracks[0].artist = "Latest author"
         snapshot.title = "Renamed folder"
+        snapshot.artist, snapshot.date = "Album artist", "2025 spring"
         self.window.save_album(snapshot)
         self.assertEqual(self.first.title, "Renamed folder")
         self.assertEqual(self.first.tracks[0].title, "Latest title")
         self.assertEqual(self.song.artist, "Latest author")
+        saved_entries, _, _ = Store(self.window.store.path).load()
+        saved_album = next(entry for entry in saved_entries if entry.id == self.first.id)
+        self.assertEqual((saved_album.artist, saved_album.date), ("Album artist", "2025 spring"))
+        detail = EntryDetailsDialog(self.window, self.first)
+        try:
+            self.assertIn("Album artist", detail.artist_label.text())
+            self.assertIn("2025 spring", detail.date_label.text())
+        finally:
+            detail.close()
+            detail.deleteLater()
 
     def test_folder_remove_and_delete_leave_song_entity_available(self):
         snapshot = deepcopy(self.first)

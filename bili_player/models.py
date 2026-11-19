@@ -12,6 +12,8 @@ from uuid import uuid4
 
 
 DEFAULT_VOLUME = 70
+MINI_COVER_STYLES = ("classic", "record")
+DEFAULT_MINI_COVER_STYLE = MINI_COVER_STYLES[0]
 _BVID = re.compile(r"BV[0-9A-Za-z]{10}", re.IGNORECASE)
 _DEFAULT_SETTINGS = {"theme": "light", "language": "zh_CN"}
 
@@ -121,6 +123,8 @@ class Store:
             value = result["card_scale"]
             if type(value) not in (int, float) or not 0.7 <= value <= 1.6:
                 raise ValueError("卡片缩放必须在 70% 到 160% 之间")
+        if "mini_cover_style" in result and result["mini_cover_style"] not in MINI_COVER_STYLES:
+            raise ValueError("不支持的迷你播放器样式")
         if "audio_output_id" in result:
             _text(result["audio_output_id"], "音频输出设备 ID")
         if "play_mode" in result:

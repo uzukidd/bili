@@ -38,6 +38,14 @@ class _Dialog(QDialog):
         widget.clicked.connect(callback)
         return widget
 
+    def _choose_cover(self, title, target):
+        filename, _ = QFileDialog.getOpenFileName(
+            self, self.tr(title), "",
+            self.tr("图片文件 (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;所有文件 (*)"),
+        )
+        if filename:
+            target.setText(str(Path(filename).expanduser().resolve()))
+
     def _buttons(self, layout: QVBoxLayout) -> QDialogButtonBox:
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel,
@@ -90,6 +98,14 @@ class EntryDialog(_Dialog):
         form.addRow(self.tr("名称"), self.title_input)
         form.addRow(self.artist_label, self.artist_input)
         form.addRow(self.date_label, self.date_input)
+        self.cover_input = None
+        if entry is not None and entry.kind == "single":
+            self.cover_input = QLineEdit(entry.cover)
+            self.cover_input.setPlaceholderText(self.tr("图片链接或本地图片路径"))
+            cover_row = QHBoxLayout()
+            cover_row.addWidget(self.cover_input, 1)
+            cover_row.addWidget(self._button("选择图片", lambda: self._choose_cover("选择图片", self.cover_input)))
+            form.addRow(self.tr("封面"), cover_row)
         form.addRow(self.tr("BV / 链接"), self.bvid_input)
         form.addRow(self.tr("类型"), self.kind_input)
         form.addRow(self.tr("分 P"), self.page_input)
@@ -128,6 +144,10 @@ class EntryDialog(_Dialog):
             self.entry.bvid, self.entry.page, self.entry.kind,
         ):
             changes.update(tracks=[], cover="", resolved=False)
+        if self.cover_input is not None:
+            cover = self.cover_input.text().strip()
+            if "cover" not in changes or cover != self.entry.cover:
+                changes["cover"] = cover
         return replace(deepcopy(self.entry), **changes)
 
     def accept(self):
@@ -253,6 +273,11 @@ class AlbumDialog(_Dialog):
         self.title_input = QLineEdit(self.entry.title)
         self.title_input.setPlaceholderText(self.tr("请输入专辑名称"))
         form.addRow(self.tr("专辑名称"), self.title_input)
+        self.artist_input = QLineEdit(self.entry.artist)
+        self.date_input = QLineEdit(self.entry.date)
+        self.date_input.setPlaceholderText(self.tr("手动填写日期，例如 2025-01-01（可留空）"))
+        form.addRow(self.tr("艺术家"), self.artist_input)
+        form.addRow(self.tr("日期"), self.date_input)
         self.cover_input = QLineEdit(self.entry.cover)
         self.cover_input.setPlaceholderText(self.tr("图片链接或本地图片路径"))
         cover_row = QHBoxLayout()
@@ -395,12 +420,7 @@ class AlbumDialog(_Dialog):
         self._update_controls()
 
     def choose_cover(self, *_):
-        filename, _ = QFileDialog.getOpenFileName(
-            self, self.tr("选择专辑封面"), "",
-            self.tr("图片文件 (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;所有文件 (*)"),
-        )
-        if filename:
-            self.cover_input.setText(str(Path(filename).expanduser().resolve()))
+        self._choose_cover("选择专辑封面", self.cover_input)
 
     def _run(self, fn: Callable, done: Callable):
         if not self._alive:
@@ -562,6 +582,7 @@ class AlbumDialog(_Dialog):
             raise ValueError(self.tr("请输入专辑名称。"))
         return replace(
             deepcopy(self.entry), title=title, cover=self.cover_input.text().strip(),
+            artist=self.artist_input.text().strip(), date=self.date_input.text().strip(),
             tracks=self._tracks(), kind="album", resolved=True,
         )
 

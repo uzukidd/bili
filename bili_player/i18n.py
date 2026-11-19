@@ -5,6 +5,8 @@ import re
 
 ENGLISH = {
     "设置": "Settings", "音频输出设备": "Audio output device",
+    "迷你播放器样式": "Mini player style", "经典封面": "Classic cover", "圆形唱片": "Spinning record",
+    "不支持的迷你播放器样式": "Unsupported mini player style",
     "系统默认": "System default", "系统默认 · {device}": "System default · {device}",
     "已保存设备（当前未连接）": "Saved device (disconnected)",
     "未检测到音频输出设备": "No audio output devices detected",
@@ -56,6 +58,7 @@ ENGLISH = {
     "拖动曲目可调整顺序；双击可编辑名称、作者、日期和来源。": "Drag to reorder; double-click to edit title, author, date, or source.",
     "单曲 · {duration}": "Single · {duration}",
     "作者：{author}": "Author: {author}", "日期：{date}": "Date: {date}",
+    "艺术家：{artist}": "Artist: {artist}",
     "未填写": "Not set",
     "双击打开单曲详情": "Double-click to open track details",
     "插入队列": "Play next",

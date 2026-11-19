@@ -10,7 +10,9 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QTimer
-from PyQt6.QtMultimedia import QAudioDevice, QMediaDevices
+from PyQt6.QtGui import QColor, QPainter, QPixmap
+from PyQt6.QtMultimedia import QAudioDevice, QMediaDevices, QMediaPlayer
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from bili_player.app import MainWindow
@@ -69,6 +71,63 @@ class SettingsTests(unittest.TestCase):
         store = Store(self.path)
         store.load()
         self.assertEqual((store.settings["theme"], store.settings["language"]), ("dark", "en_US"))
+
+    def test_mini_style_previews_select_and_restore_saved_style(self):
+        dialog = self.window._settings_dialog = SettingsDialog(self.window)
+        dialog.refresh_preferences()
+        classic = dialog.mini_cover_buttons["classic"]
+        record = dialog.mini_cover_buttons["record"]
+        self.assertFalse(classic.icon().isNull())
+        self.assertFalse(record.icon().isNull())
+        size = classic.iconSize()
+        self.assertNotEqual(classic.icon().pixmap(size).toImage(), record.icon().pixmap(size).toImage())
+        self.assertTrue(classic.isChecked())
+
+        with patch.object(self.window.player, "stop") as stop:
+            record.click()
+            stop.assert_not_called()
+        self.assertTrue(record.isChecked())
+        self.assertFalse(classic.isChecked())
+        self.assertEqual(self.window.mini_cover.cover_style, "record")
+
+        reopened = MainWindow(self.path)
+        self.addCleanup(self.close_window, reopened)
+        self.assertEqual(reopened.mini_cover.cover_style, "record")
+        classic.click()
+        self.assertEqual(self.window.mini_cover.cover_style, "classic")
+
+    def test_visible_record_rotates_pauses_and_resumes_at_current_angle(self):
+        self.window.set_mini_cover_style("record")
+        self.window.set_mini_mode(True)
+        self.window.show()
+        cover = self.window.mini_cover
+        pixmap = QPixmap(160, 160)
+        pixmap.fill(QColor("#9e75c7"))
+        painter = QPainter(pixmap)
+        painter.fillRect(0, 0, 80, 160, QColor("#e382a6"))
+        painter.end()
+        cover.set_pixmap(pixmap)
+        initial_image = cover.grab().toImage()
+        states = QMediaPlayer.PlaybackState
+        self.window._playback_state(states.PlayingState)
+        QTest.qWait(65)
+        self.window._playback_state(states.PausedState)
+        paused_angle = cover.angle
+        paused_image = cover.grab().toImage()
+        self.assertGreater(paused_angle, 0)
+        self.assertNotEqual(initial_image, paused_image)
+        QTest.qWait(65)
+        self.assertEqual(cover.angle, paused_angle)
+        self.assertEqual(cover.grab().toImage(), paused_image)
+        self.window._playback_state(states.PlayingState)
+        self.assertAlmostEqual(cover.angle, paused_angle, delta=1)
+        QTest.qWait(65)
+        self.assertGreater(cover.angle, paused_angle)
+
+        self.window.set_mini_mode(False)
+        hidden_angle = cover.angle
+        QTest.qWait(65)
+        self.assertEqual(cover.angle, hidden_angle)
 
     def test_output_selection_routes_existing_player_and_survives_restart(self):
         default = output(b"built-in", "Speakers")

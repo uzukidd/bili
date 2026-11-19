@@ -33,4 +33,4 @@ bash scripts/deploy.sh
 
 - Mini music player
 
-  ![image-20261119140311873](./README.assets/image-20261119140311873.png)
+  ![image-20261120002502660](README.assets/image-20261120002502660.png)

@@ -13,7 +13,7 @@ from copy import deepcopy
 from dataclasses import replace
 from unittest.mock import patch
 
-from PyQt6.QtWidgets import QApplication, QDialog
+from PyQt6.QtWidgets import QApplication, QDialog, QPushButton
 
 from bili_player.dialogs import AlbumDialog, EntryDialog, TrackDialog
 from bili_player.models import LibraryEntry, Track
@@ -134,6 +134,22 @@ class MetadataDialogTests(unittest.TestCase):
                 self.assertEqual((value.artist, value.date), ("作曲者 あおい", "任意日期"))
                 self.assertEqual((value.tracks, value.cover, value.resolved), ([], "", False))
                 self.assertEqual(original, before)
+
+    def test_single_edit_selects_cover_and_keeps_it_when_video_source_changes(self):
+        original = self.cached_single()
+        dialog = self.entry_dialog(original)
+        self.assertEqual(dialog.cover_input.text(), original.cover)
+        picture = os.path.abspath("new cover.png")
+        with patch("bili_player.dialogs.QFileDialog.getOpenFileName", return_value=(picture, "")):
+            choose_button = next(button for button in dialog.findChildren(QPushButton)
+                                 if button.text() == "选择图片")
+            choose_button.click()
+        self.assertEqual(dialog.value().cover, picture)
+        dialog.bvid_input.setText(OTHER_BVID)
+        dialog.cover_input.setText(" https://example.com/new.jpg ")
+        self.assertEqual(dialog.value().cover, "https://example.com/new.jpg")
+        self.assertFalse(dialog.value().resolved)
+        self.assertEqual(original.cover, "https://example.com/cover.jpg")
 
     def test_existing_single_kind_is_disabled_while_import_kind_can_be_chosen(self):
         existing = self.entry_dialog(self.cached_single())

@@ -135,8 +135,11 @@ class EntryDetailsDialog(QDialog):
         self.track_rows = []
         self.setObjectName("root")
         self._frameless_controller = FramelessController(self)
-        self.setMinimumSize(640, 500)
-        self.resize(780, 680)
+        is_single = entry.kind == "single"
+        self.setMinimumWidth(640)
+        if not is_single:
+            self.setMinimumHeight(500)
+            self.resize(780, 680)
         window_layout = QVBoxLayout(self)
         window_layout.setContentsMargins(1, 1, 1, 1)
         window_layout.setSpacing(0)
@@ -155,7 +158,7 @@ class EntryDetailsDialog(QDialog):
         self.content = QWidget()
         self.content.setObjectName("detailContent")
         content_layout = QVBoxLayout(self.content)
-        content_layout.setContentsMargins(0, 0, 8, 12)
+        content_layout.setContentsMargins(0, 0, 0 if is_single else 8, 0 if is_single else 12)
         content_layout.setSpacing(16)
         self.hero = QFrame()
         self.hero.setObjectName("queuePanel")
@@ -265,6 +268,11 @@ class EntryDetailsDialog(QDialog):
         actions.addWidget(self.close_button)
         layout.addLayout(actions)
         self.refresh()
+        if is_single:
+            self.ensurePolished()
+            self.scroll_area.setMinimumHeight(self.hero.height() + 2 * self.scroll_area.frameWidth())
+            window_layout.activate()
+            self.resize(700, window_layout.minimumSize().height())
         changed = getattr(parent, "libraryChanged", None)
         if changed is not None:
             changed.connect(self.refresh)
@@ -365,7 +373,6 @@ class EntryDetailsDialog(QDialog):
             "单曲 · {duration}" if is_single else "专辑 · {count} 首 · {duration}",
             count=len(entry.tracks), duration=_duration(sum(track.duration for track in entry.tracks)),
         ))
-        artists = list(dict.fromkeys(track.artist for track in entry.tracks if track.artist.strip()))
         if is_single:
             author = entry.artist or (entry.tracks[0].artist if entry.tracks else "")
             date = entry.date or (entry.tracks[0].date if entry.tracks else "")
@@ -374,9 +381,13 @@ class EntryDetailsDialog(QDialog):
             self.date_label.setText(self.tr("日期：{date}", date=date or self.tr("未填写")))
             self.date_label.show()
         else:
-            self.artist_label.setText(" · ".join(artists))
-            self.artist_label.setVisible(bool(artists))
-            self.date_label.hide()
+            artist, date = entry.artist.strip(), entry.date.strip()
+            artist_text = (self.tr("艺术家：{artist}", artist=artist) if artist else
+                           " · ".join(dict.fromkeys(track.artist.strip() for track in entry.tracks if track.artist.strip())))
+            self.artist_label.setText(artist_text)
+            self.artist_label.setVisible(bool(artist_text))
+            self.date_label.setText(self.tr("日期：{date}", date=date) if date else "")
+            self.date_label.setVisible(bool(date))
         self.source_label.setText(self.tr("来源：{bvid}", bvid=entry.bvid) if entry.bvid else "")
         self.source_label.setVisible(bool(entry.bvid))
         self.tracks_list.clear()

@@ -393,7 +393,11 @@ class WindowTests(unittest.TestCase):
         self.window._submit = lambda fn, done, error=None: jobs.append(done)
         self.window.play_item(self.window.queue.item(0))
         self.assertEqual(self.window.mini_title.text(), "Song 1")
-        self.assertEqual(self.window.mini_meta.text(), f"{BV} · P1")
+        self.assertEqual(self.window.now_meta.text(), "")
+        self.assertEqual(self.window.mini_meta.text(), "")
+        self.assertTrue(self.window.now_meta.isHidden())
+        self.assertTrue(self.window.mini_meta.isHidden())
+        self.assertEqual(self.window.queue.item(0).text(), "Song 1")
         self.window.song_for_track(tracks[1]).cover = "second"
         self.assertEqual(self.window.entries[0].cover, "first")
         self.window.play_item(self.window.queue.item(1))
