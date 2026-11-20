@@ -4,6 +4,8 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping
+from io import StringIO
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import network
@@ -27,6 +29,52 @@ _MEDIA_HEADERS = {"accept", "accept-language", "origin", "referer", "sec-fetch-m
 
 class YouTubeError(Exception):
     pass
+
+
+def _is_youtube_domain(domain: str) -> bool:
+    domain = domain.lstrip(".").lower()
+    return domain == "youtube.com" or domain.endswith(".youtube.com")
+
+
+def read_youtube_cookie_file(path: str) -> str:
+    """Read a bounded copy, without importing unrelated site sessions."""
+    if not path:
+        raise YouTubeError("请在设置中选择 YouTube Cookie 文件")
+    limit = 1024 * 1024
+    try:
+        with Path(path).open("rb") as file:
+            raw = file.read(limit + 1)
+    except (OSError, ValueError) as exc:
+        raise YouTubeError("无法读取 YouTube Cookie 文件，请重新选择") from exc
+    if len(raw) > limit:
+        raise YouTubeError("YouTube Cookie 文件不能超过 1 MiB")
+    try:
+        lines = raw.decode("utf-8-sig").splitlines()
+    except UnicodeError as exc:
+        raise YouTubeError("Cookie 文件须为 Netscape cookies.txt 格式") from exc
+    if not lines or lines[0].strip() not in ("# Netscape HTTP Cookie File", "# HTTP Cookie File"):
+        raise YouTubeError("Cookie 文件须为 Netscape cookies.txt 格式")
+    rows = []
+    for line in lines[1:]:
+        prefix = "#HttpOnly_"
+        if not line.strip() or (line.startswith("#") and not line.startswith(prefix)):
+            continue
+        fields = line.removeprefix(prefix).split("\t")
+        if len(fields) != 7:
+            raise YouTubeError("Cookie 文件须为 Netscape cookies.txt 格式")
+        domain, subdomains, cookie_path, secure, expires, name, value = fields
+        if (subdomains not in ("TRUE", "FALSE") or secure not in ("TRUE", "FALSE")
+                or (subdomains == "TRUE") != domain.startswith(".")
+                or not cookie_path.startswith("/")
+                or (expires and not re.fullmatch(r"[0-9]{1,18}(?:\.[0-9]{1,6})?", expires))
+                or any(ord(char) < 32 or ord(char) == 127 for field in fields for char in field)):
+            raise YouTubeError("Cookie 文件须为 Netscape cookies.txt 格式")
+        host = domain.removeprefix(".")
+        if re.fullmatch(r"[a-zA-Z0-9.-]+", host) and not host.startswith(".") and _is_youtube_domain(host):
+            rows.append(line)
+    if not rows:
+        raise YouTubeError("Cookie 文件没有 YouTube 条目，请只导出 youtube.com 的 Cookie")
+    return "\n".join(["# Netscape HTTP Cookie File", *rows, ""])
 
 
 class _StreamURL(str):
@@ -66,9 +114,10 @@ def _media_headers(*sources: object) -> dict[str, str]:
 
 
 class YouTubeClient:
-    def __init__(self, timeout: float = 15, *, use_chrome: bool = True):
+    def __init__(self, timeout: float = 15, *, use_chrome: bool = True, cookie_file: str | None = None):
         self.timeout = timeout
         self.use_chrome = use_chrome
+        self.cookie_file = cookie_file
 
     def _extract(self, video_id: str) -> dict:
         if not isinstance(video_id, str) or not _VIDEO_ID.fullmatch(video_id):
@@ -87,8 +136,12 @@ class YouTubeClient:
             "skip_download": True,
             "socket_timeout": self.timeout,
         }
+        manual = self.cookie_file is not None
+        if manual:
+            # yt-dlp writes cookies back on close; a text stream keeps those writes off disk.
+            options["cookiefile"] = StringIO(read_youtube_cookie_file(self.cookie_file))
         chrome_unavailable = False
-        for use_chrome in ((True, False) if self.use_chrome else (False,)):
+        for use_chrome in ((True, False) if self.use_chrome and not manual else (False,)):
             try:
                 settings = {**options, "cookiesfrombrowser": ("chrome",)} if use_chrome else options
                 with yt_dlp.YoutubeDL(settings) as extractor:
@@ -96,8 +149,7 @@ class YouTubeClient:
                         try:
                             cookies = extractor.cookiejar
                             for cookie in list(cookies):
-                                domain = cookie.domain.lstrip(".").lower()
-                                if domain != "youtube.com" and not domain.endswith(".youtube.com"):
+                                if not _is_youtube_domain(cookie.domain):
                                     cookies.clear(cookie.domain, cookie.path, cookie.name)
                             if not cookies:
                                 chrome_unavailable = True
@@ -106,6 +158,8 @@ class YouTubeClient:
                             chrome_unavailable = True
                             continue
                     info = extractor.extract_info(_WATCH_URL + video_id, download=False, ie_key="Youtube")
+            except CookieLoadError as exc:
+                raise YouTubeError("无法读取 YouTube Cookie 文件，请重新选择" if manual else _UNAVAILABLE_VIDEO) from exc
             except (DownloadError, OSError) as exc:
                 message = "无法使用 Chrome 的 YouTube 会话，匿名访问也失败了" if chrome_unavailable else _UNAVAILABLE_VIDEO
                 raise YouTubeError(message) from exc

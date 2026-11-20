@@ -85,6 +85,71 @@ class SettingsTests(unittest.TestCase):
         entry = LibraryEntry("Video", "BaW_jenozKc", provider="youtube")
         self.assertFalse(reopened._source_client(entry).use_chrome)
 
+    def test_youtube_cookie_mode_shows_instructions_and_restores_path(self):
+        from bili_player.models import LibraryEntry
+        from bili_player.youtube import YouTubeError
+
+        entry = LibraryEntry("Video", "BaW_jenozKc", provider="youtube")
+        cookies = Path(self.directory.name) / "YouTube cookies.txt"
+        cookies.write_text("# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tsession\tdummy-secret\n",
+                           encoding="utf-8")
+        dialog = self.window._settings_dialog = SettingsDialog(self.window)
+        dialog.refresh_preferences()
+        self.assertTrue(dialog.youtube_cookie_panel.isHidden())
+        index = dialog.youtube_session_combo.findData("file")
+        dialog.youtube_session_combo.setCurrentIndex(index)
+        dialog.youtube_session_combo.activated.emit(index)
+        self.assertFalse(dialog.youtube_cookie_panel.isHidden())
+        self.assertIn("Get cookies.txt LOCALLY", dialog.youtube_cookie_hint.text())
+        self.assertIn("robots.txt", dialog.youtube_cookie_hint.text())
+        self.assertIn("请勿分享", dialog.youtube_cookie_hint.text())
+        with patch("bili_player.settings_dialog.QFileDialog.getOpenFileName", return_value=(str(cookies), "")):
+            dialog.youtube_cookie_choose.click()
+        self.assertEqual(dialog.youtube_cookie_path.text(), str(cookies.resolve()))
+        self.assertNotIn("dummy-secret", self.path.read_text(encoding="utf-8"))
+
+        reopened = MainWindow(self.path)
+        self.addCleanup(self.close_window, reopened)
+        client = reopened._source_client(entry)
+        self.assertFalse(client.use_chrome)
+        self.assertEqual(client.cookie_file, str(cookies.resolve()))
+        dialog.youtube_cookie_clear.click()
+        self.assertEqual(dialog.youtube_cookie_path.text(), "")
+        self.assertEqual(self.window._source_client(entry).cookie_file, "")
+        with self.assertRaisesRegex(YouTubeError, "请在设置中选择"):
+            self.window._source_client(entry).get_video(entry)
+        dialog.youtube_session_combo.setCurrentIndex(1)
+        dialog.youtube_session_combo.activated.emit(1)
+        self.assertTrue(dialog.youtube_cookie_panel.isHidden())
+        self.assertIsNone(self.window._source_client(entry).cookie_file)
+
+    def test_long_settings_scroll_without_moving_close_button(self):
+        self.window.set_youtube_session("file")
+        dialog = self.window._settings_dialog = SettingsDialog(self.window)
+        self.window._refresh_settings()
+        dialog.resize(560, 360)
+        dialog.show()
+        try:
+            self.app.processEvents()
+            area = dialog.scroll_area
+            bar = area.verticalScrollBar()
+            bar.setValue(0)
+            self.assertTrue(bar.isVisible())
+            self.assertGreater(bar.maximum(), 0)
+            self.assertTrue(dialog.close_button.isVisible())
+            close_pos = dialog.close_button.mapTo(dialog, dialog.close_button.rect().center())
+
+            area.ensureWidgetVisible(dialog.youtube_cookie_hint)
+            hint = dialog.youtube_cookie_hint
+            self.assertTrue(area.viewport().rect().contains(hint.mapTo(area.viewport(), hint.rect().center())))
+            bar.setValue(bar.maximum())
+            cache = dialog.clear_cache_button
+            self.assertTrue(area.viewport().rect().contains(cache.mapTo(area.viewport(), cache.rect().center())))
+            self.assertEqual(dialog.close_button.mapTo(dialog, dialog.close_button.rect().center()), close_pos)
+        finally:
+            dialog.close()
+            self.window._settings_dialog = None
+
     def test_proxy_applies_only_after_validation_and_persists_on_reopen(self):
         from bili_player.network import proxy_for_url
 

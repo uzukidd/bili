@@ -21,7 +21,9 @@ from .youtube import YouTubeClient
 
 def _client(provider: str, owner) -> BilibiliClient | YouTubeClient:
     if provider == "youtube":
-        return YouTubeClient(use_chrome=getattr(owner, "youtube_use_chrome", True))
+        manual = getattr(owner, "youtube_use_cookie_file", False)
+        return YouTubeClient(use_chrome=getattr(owner, "youtube_use_chrome", True) and not manual,
+                             cookie_file=getattr(owner, "youtube_cookie_file", "") if manual else None)
     return BilibiliClient()
 
 

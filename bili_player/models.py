@@ -208,6 +208,10 @@ class Store:
             _text(result["audio_output_id"], "音频输出设备 ID")
         if "youtube_use_chrome" in result and type(result["youtube_use_chrome"]) is not bool:
             raise ValueError("YouTube 登录设置必须是布尔值")
+        if "youtube_use_cookie_file" in result and type(result["youtube_use_cookie_file"]) is not bool:
+            raise ValueError("YouTube Cookie 文件模式必须是布尔值")
+        if "youtube_cookie_file" in result:
+            _text(result["youtube_cookie_file"], "YouTube Cookie 文件路径")
         if "proxy_mode" in result or "proxy_url" in result:
             from .network import validate_proxy_url
 

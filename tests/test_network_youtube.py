@@ -4,6 +4,7 @@ import os
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, Mock, patch
 
@@ -149,6 +150,7 @@ class YouTubeTests(unittest.TestCase):
         self.addCleanup(network.set_proxy, "system", "")
         network.set_proxy("system", "")
         self.extractor = MagicMock()
+        self.real_factory = yt_dlp.YoutubeDL
         self.factory = MagicMock()
         self.factory.return_value.__enter__.return_value = self.extractor
         patcher = patch.object(yt_dlp, "YoutubeDL", self.factory)
@@ -203,6 +205,59 @@ class YouTubeTests(unittest.TestCase):
         self.assertEqual(original["cookiesfrombrowser"], ("chrome",))
         self.assertNotIn("cookiesfrombrowser", retry)
         self.extractor.extract_info.assert_called_once()
+
+    def test_manual_cookie_file_takes_precedence_and_only_passes_youtube_cookies(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "YouTube cookies.txt"
+            text = ("# Netscape HTTP Cookie File\n"
+                    "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tsession\tlocal-test\n"
+                    ".example.org\tTRUE\t/\tTRUE\t0\tother\tprivate-test\n")
+            path.write_text(text, encoding="utf-8")
+            original = path.read_bytes()
+            result = YouTubeClient(use_chrome=True, cookie_file=str(path)).get_video(self.entry)
+            self.assertEqual(result.title, "Video")
+            self.factory.assert_called_once()
+            options = self.factory.call_args.args[0]
+            self.assertNotIn("cookiesfrombrowser", options)
+            cookies = options["cookiefile"].getvalue()
+            self.assertIn("#HttpOnly_.youtube.com", cookies)
+            self.assertNotIn("private-test", cookies)
+            options["cookiefile"].write("mock updated cookie")
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_real_ytdlp_loads_manual_cookie_stream_without_rewriting_file(self):
+        seen = []
+
+        def fake_extract(extractor, *_args, **_kwargs):
+            seen.extend((cookie.domain, cookie.name) for cookie in extractor.cookiejar)
+            return self.info
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "cookies.txt"
+            original = (b"# Netscape HTTP Cookie File\r\n"
+                        b"#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tsession\tmock\r\n")
+            path.write_bytes(original)
+            with patch.object(yt_dlp, "YoutubeDL", self.real_factory), \
+                 patch.object(self.real_factory, "extract_info", fake_extract):
+                YouTubeClient(cookie_file=str(path)).get_video(self.entry)
+            self.assertEqual(seen, [(".youtube.com", "session")])
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_missing_and_invalid_manual_cookie_files_do_not_try_chrome_or_network(self):
+        with TemporaryDirectory() as directory:
+            file = Path(directory) / "cookies.txt"
+            with self.assertRaisesRegex(YouTubeError, "请在设置中选择"):
+                YouTubeClient(cookie_file="").get_video(self.entry)
+            with self.assertRaisesRegex(YouTubeError, "无法读取 YouTube Cookie 文件"):
+                YouTubeClient(cookie_file=str(file)).get_video(self.entry)
+            file.write_text('{"not": "Netscape"}', encoding="utf-8")
+            with self.assertRaisesRegex(YouTubeError, "Netscape"):
+                YouTubeClient(cookie_file=str(file)).get_video(self.entry)
+            file.write_text("# Netscape HTTP Cookie File\n.youtube.com.example.org\tTRUE\t/\tTRUE\t0\tsession\tmock\n",
+                            encoding="utf-8")
+            with self.assertRaisesRegex(YouTubeError, "没有 YouTube 条目"):
+                YouTubeClient(cookie_file=str(file)).get_video(self.entry)
+            self.factory.assert_not_called()
 
     def test_rejects_mutated_source_and_mismatched_or_playlist_results(self):
         self.entry.bvid = "https://youtu.be/" + VIDEO_ID

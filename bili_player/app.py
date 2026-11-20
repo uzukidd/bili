@@ -39,7 +39,7 @@ from .mini_cover import CoverButton
 from .mini_lyrics import MiniLyrics
 from .models import DEFAULT_MINI_COVER_STYLE, MINI_COVER_STYLES, LibraryEntry, Store, Track
 from .network import set_proxy, validate_proxy_url
-from .youtube import YouTubeClient
+from .youtube import YouTubeClient, YouTubeError, read_youtube_cookie_file
 from .playback_order import ShuffleOrder
 from .window_chrome import TitleBar, FramelessController
 from .stream import StreamProxy
@@ -208,6 +208,8 @@ class MainWindow(QMainWindow):
         self.proxy_mode = self.store.settings.get("proxy_mode", "system")
         self.proxy_url = self.store.settings.get("proxy_url", "")
         self.youtube_use_chrome = self.store.settings.get("youtube_use_chrome", True)
+        self.youtube_use_cookie_file = self.store.settings.get("youtube_use_cookie_file", False)
+        self.youtube_cookie_file = self.store.settings.get("youtube_cookie_file", "")
         set_proxy(self.proxy_mode, self.proxy_url)
         self.mini_cover_style = self.store.settings.get("mini_cover_style", DEFAULT_MINI_COVER_STYLE)
         self.audio_output_id = self.store.settings.get("audio_output_id", "")
@@ -1223,14 +1225,37 @@ class MainWindow(QMainWindow):
         self._save()
 
     def set_youtube_use_chrome(self, enabled: bool):
-        previous = self.youtube_use_chrome
-        if enabled == previous:
+        self.set_youtube_session(enabled)
+
+    def set_youtube_session(self, choice: bool | str):
+        previous = self.youtube_use_chrome, self.youtube_use_cookie_file
+        manual = choice == "file"
+        chrome = self.youtube_use_chrome if manual else choice is True
+        if previous == (chrome, manual):
             return
-        self.youtube_use_chrome = enabled
+        self.youtube_use_chrome, self.youtube_use_cookie_file = chrome, manual
         if not self._save():
-            self.youtube_use_chrome = previous
-            if self._settings_dialog is not None:
-                self._settings_dialog.refresh_preferences()
+            self.youtube_use_chrome, self.youtube_use_cookie_file = previous
+        if self._settings_dialog is not None:
+            self._settings_dialog.refresh_youtube_session()
+
+    def set_youtube_cookie_file(self, filename: str) -> str | None:
+        if filename:
+            try:
+                filename = str(Path(filename).expanduser().resolve())
+                read_youtube_cookie_file(filename)
+            except YouTubeError as exc:
+                return str(exc)
+            except (OSError, RuntimeError, ValueError):
+                return "无法读取 YouTube Cookie 文件，请重新选择"
+        previous = self.youtube_cookie_file
+        if previous == filename:
+            return None
+        self.youtube_cookie_file = filename
+        if not self._save():
+            self.youtube_cookie_file = previous
+            return "无法保存 YouTube Cookie 文件设置"
+        return None
 
     def set_proxy_settings(self, mode: str, address: str) -> str | None:
         try:
@@ -1371,7 +1396,10 @@ class MainWindow(QMainWindow):
             self.import_entry(dialog.value())
 
     def _source_client(self, entry):
-        return YouTubeClient(use_chrome=self.youtube_use_chrome) if entry.provider == "youtube" else BilibiliClient()
+        if entry.provider == "youtube":
+            return YouTubeClient(use_chrome=self.youtube_use_chrome and not self.youtube_use_cookie_file,
+                                 cookie_file=self.youtube_cookie_file if self.youtube_use_cookie_file else None)
+        return BilibiliClient()
 
     def import_entry(self, entry: LibraryEntry):
         self._status("正在导入 {title}…", title=entry.title or entry.bvid)
@@ -2132,7 +2160,9 @@ class MainWindow(QMainWindow):
                             {"theme": self.theme, "language": self.language, "card_scale": self.card_scale,
                              "play_mode": self.mode.currentIndex(), "audio_output_id": self.audio_output_id,
                              "mini_cover_style": self.mini_cover_style, "proxy_mode": self.proxy_mode,
-                             "proxy_url": self.proxy_url, "youtube_use_chrome": self.youtube_use_chrome})
+                             "proxy_url": self.proxy_url, "youtube_use_chrome": self.youtube_use_chrome,
+                             "youtube_use_cookie_file": self.youtube_use_cookie_file,
+                             "youtube_cookie_file": self.youtube_cookie_file})
             return True
         except (ValueError, OSError) as exc:
             self._status("保存失败：{message}", message=translate_error(str(exc), self.language))

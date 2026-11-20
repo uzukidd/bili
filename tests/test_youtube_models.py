@@ -151,6 +151,8 @@ class YouTubeDialogTests(unittest.TestCase):
     def test_album_resolves_uncached_youtube_single_and_changed_track(self):
         entry = LibraryEntry("YouTube song", YT, provider="youtube")
         parent = QWidget()
+        parent.youtube_use_cookie_file = True
+        parent.youtube_cookie_file = "youtube-cookies.txt"
         parent._submit = lambda work, success, _failure: success(work())
         album = AlbumDialog(parent, LibraryEntry("Mixed", kind="album"), [entry])
         yt_track = youtube_track()
@@ -163,6 +165,7 @@ class YouTubeDialogTests(unittest.TestCase):
             youtube.return_value.get_tracks.return_value = [yt_track]
             with patch("bili_player.dialogs._SinglesDialog", return_value=singles_picker):
                 album.add_existing_singles()
+            youtube.assert_called_with(use_chrome=False, cookie_file="youtube-cookies.txt")
             youtube.return_value.get_tracks.assert_called_once_with(entry)
             original = album.value().tracks[0]
             self.assertEqual((original.provider, original.song_id), ("youtube", entry.id))
