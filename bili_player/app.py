@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
-    QSlider, QSplitter, QStackedWidget, QSystemTrayIcon, QTabBar, QVBoxLayout, QWidget,
+    QSlider, QSplitter, QStackedLayout, QStackedWidget, QSystemTrayIcon, QTabBar, QVBoxLayout, QWidget,
 )
 
 from .api import BilibiliClient
@@ -34,8 +34,12 @@ from .dialogs import AlbumDialog, EntryDialog
 from .exchange import read_library, write_library
 from .i18n import translate, translate_error
 from .list_dialog import ListImportDialog
+from .lyrics import LyricsStore
 from .mini_cover import CoverButton
+from .mini_lyrics import MiniLyrics
 from .models import DEFAULT_MINI_COVER_STYLE, MINI_COVER_STYLES, LibraryEntry, Store, Track
+from .network import set_proxy, validate_proxy_url
+from .youtube import YouTubeClient, YouTubeError, read_youtube_cookie_file
 from .playback_order import ShuffleOrder
 from .window_chrome import TitleBar, FramelessController
 from .stream import StreamProxy
@@ -178,6 +182,7 @@ class PlayerPages(QStackedWidget):
 
 class MainWindow(QMainWindow):
     libraryChanged = pyqtSignal()
+    lyricsChanged = pyqtSignal(str)
 
     def __init__(self, store_path: Path | None = None):
         super().__init__()
@@ -190,6 +195,7 @@ class MainWindow(QMainWindow):
                 QStandardPaths.StandardLocation.AppDataLocation,
             )) / "library.json"
         self.store = Store(store_path)
+        self.lyrics_store = LyricsStore(self.store.path.with_name("lyrics.json"))
         self.entries: list[LibraryEntry] = []
         tracks: list[Track] = []
         volume, load_error = 70, ""
@@ -199,6 +205,12 @@ class MainWindow(QMainWindow):
             load_error = str(exc)
         self.theme = self.store.settings["theme"]
         self.language = self.store.settings["language"]
+        self.proxy_mode = self.store.settings.get("proxy_mode", "system")
+        self.proxy_url = self.store.settings.get("proxy_url", "")
+        self.youtube_use_chrome = self.store.settings.get("youtube_use_chrome", True)
+        self.youtube_use_cookie_file = self.store.settings.get("youtube_use_cookie_file", False)
+        self.youtube_cookie_file = self.store.settings.get("youtube_cookie_file", "")
+        set_proxy(self.proxy_mode, self.proxy_url)
         self.mini_cover_style = self.store.settings.get("mini_cover_style", DEFAULT_MINI_COVER_STYLE)
         self.audio_output_id = self.store.settings.get("audio_output_id", "")
         self._settings_dialog: SettingsDialog | None = None
@@ -336,7 +348,7 @@ class MainWindow(QMainWindow):
         title_row.addStretch()
         title_row.addWidget(self._button("＋ 新建专辑", self.new_album))
         title_row.addWidget(self._button("导入列表", self.import_list))
-        title_row.addWidget(self._button("＋ 导入 BV", self.add_entry, True))
+        title_row.addWidget(self._button("＋ 导入视频", self.add_entry, True))
         lib_layout.addLayout(title_row)
         filter_row = QHBoxLayout()
         self.tabs = QTabBar()
@@ -498,9 +510,17 @@ class MainWindow(QMainWindow):
         self.mini_cover.set_cover_style(self.mini_cover_style)
         self.mini_cover.setMinimumSize(240, 240)
         self.mini_cover.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.mini_cover.clicked.connect(self.toggle_play)
-        self._bind(self.mini_cover, "播放 / 暂停（空格）", "setToolTip")
-        layout.addWidget(self.mini_cover, 1)
+        self.mini_cover.clicked.connect(self._toggle_mini_lyrics)
+        self._bind(self.mini_cover, "显示歌词", "setToolTip")
+        self.mini_lyrics = MiniLyrics()
+        self.mini_lyrics.coverRequested.connect(self._toggle_mini_lyrics)
+        self._bind(self.mini_lyrics, "返回封面", "setToolTip")
+        self._bind(self.mini_lyrics, "返回封面", "setAccessibleName")
+        self.mini_artwork = QStackedLayout()
+        self.mini_artwork.addWidget(self.mini_cover)
+        self.mini_artwork.addWidget(self.mini_lyrics)
+        layout.addLayout(self.mini_artwork, 1)
+        self.lyricsChanged.connect(self._on_lyrics_changed)
         self.mini_title = label(name="section")
         self.mini_title.setWordWrap(True)
         self.mini_title.setMaximumHeight(60)
@@ -727,7 +747,65 @@ class MainWindow(QMainWindow):
         self.mini_cover.setAccessibleName(self.now_title.text())
         self.tray.setToolTip(("Bili Music · " + self.now_title.text())[:127])
 
+    def song_lyrics(self, song_id):
+        try:
+            saved = self.lyrics_store.load(song_id)
+        except (OSError, ValueError):
+            return (), None
+        return saved.entries, saved.active_id
+
+    def save_song_lyrics(self, song_id, entry):
+        if find_song(self.entries, song_id) is None:
+            return False
+        try:
+            self.lyrics_store.save(song_id, entry)
+        except (OSError, ValueError):
+            self._error(self.tr("无法保存歌词"))
+            return False
+        self.lyricsChanged.emit(song_id)
+        return True
+
+    def set_active_lyrics(self, song_id, entry_id):
+        try:
+            self.lyrics_store.set_active(song_id, entry_id)
+        except (OSError, ValueError):
+            self._error(self.tr("无法保存歌词"))
+            return False
+        self.lyricsChanged.emit(song_id)
+        return True
+
+    def _current_lyrics_song_id(self):
+        item = self._queue_item_for_id(self.current_id) if self.current_id is not None else None
+        if item is None:
+            return None
+        track = item.data(Qt.ItemDataRole.UserRole)
+        return track.song_id or track.id
+
+    def _refresh_mini_lyrics(self):
+        if self.mini_artwork.currentWidget() is not self.mini_lyrics:
+            return
+        song_id = self._current_lyrics_song_id()
+        entries, active_id = self.song_lyrics(song_id) if song_id else ((), None)
+        active = next((entry for entry in entries if entry.id == active_id), None)
+        self.mini_lyrics.set_lyrics(active.display() if active else None,
+                                   self.tr("纯音乐" if active and active.instrumental else "暂无已保存歌词"))
+        self.mini_lyrics.set_position(self.player.position())
+
+    def _on_lyrics_changed(self, song_id):
+        if song_id == self._current_lyrics_song_id():
+            self._refresh_mini_lyrics()
+
+    def _toggle_mini_lyrics(self):
+        if self.mini_artwork.currentWidget() is self.mini_cover:
+            self.mini_artwork.setCurrentWidget(self.mini_lyrics)
+            self._refresh_mini_lyrics()
+            self.mini_lyrics.setFocus()
+        else:
+            self.mini_artwork.setCurrentWidget(self.mini_cover)
+            self.mini_cover.setFocus()
+
     def _update_current_cover(self, track=None):
+        self._refresh_mini_lyrics()
         # Detach the previous song's pending cover before reusing this artwork widget.
         self.mini_cover.set_pixmap(QPixmap())
         for waiters in self._cover_waiters.values():
@@ -808,6 +886,7 @@ class MainWindow(QMainWindow):
             self.now_title.setText(self.tr("还没有正在播放的音乐"))
             self.now_meta.setText(self.tr("从音乐库点击播放"))
         self._sync_mini_text()
+        self._refresh_mini_lyrics()
         self._refresh_pin_buttons()
         self._status(*self._status_value[:1], **self._status_value[1])
         self._queue_changed(persist=False)
@@ -876,7 +955,7 @@ class MainWindow(QMainWindow):
             title = label(self.tr("给喜欢的音乐，留一个位置"), "section")
             title.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(title)
-            hint = label(self.tr("导入 BV，或新建一个空专辑开始整理。" if not self.entries else "没有匹配的音乐，换个关键词试试。"), "muted")
+            hint = label(self.tr("导入视频，或新建一个空专辑开始整理。" if not self.entries else "没有匹配的音乐，换个关键词试试。"), "muted")
             hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
             hint.setWordWrap(True)
             layout.addWidget(hint)
@@ -897,6 +976,8 @@ class MainWindow(QMainWindow):
             art.setToolTip(self.tr("打开专辑" if entry.kind == "album" else "打开单曲详情"))
             if entry.kind == "album":
                 subtitle = self.tr("专辑 · {count} 首", count=len(entry.tracks)) if entry.resolved else self.tr("专辑 · 等待导入")
+            elif entry.provider == "youtube":
+                subtitle = "YouTube"
             else:
                 subtitle = entry.tracks[0].artist if entry.tracks and entry.tracks[0].artist else self.tr("单曲 · P{page}", page=entry.page)
             card.set_content(art, entry.title, subtitle, self.tr("播放"))
@@ -1143,6 +1224,56 @@ class MainWindow(QMainWindow):
         self._sync_audio_output()
         self._save()
 
+    def set_youtube_use_chrome(self, enabled: bool):
+        self.set_youtube_session(enabled)
+
+    def set_youtube_session(self, choice: bool | str):
+        previous = self.youtube_use_chrome, self.youtube_use_cookie_file
+        manual = choice == "file"
+        chrome = self.youtube_use_chrome if manual else choice is True
+        if previous == (chrome, manual):
+            return
+        self.youtube_use_chrome, self.youtube_use_cookie_file = chrome, manual
+        if not self._save():
+            self.youtube_use_chrome, self.youtube_use_cookie_file = previous
+        if self._settings_dialog is not None:
+            self._settings_dialog.refresh_youtube_session()
+
+    def set_youtube_cookie_file(self, filename: str) -> str | None:
+        if filename:
+            try:
+                filename = str(Path(filename).expanduser().resolve())
+                read_youtube_cookie_file(filename)
+            except YouTubeError as exc:
+                return str(exc)
+            except (OSError, RuntimeError, ValueError):
+                return "无法读取 YouTube Cookie 文件，请重新选择"
+        previous = self.youtube_cookie_file
+        if previous == filename:
+            return None
+        self.youtube_cookie_file = filename
+        if not self._save():
+            self.youtube_cookie_file = previous
+            return "无法保存 YouTube Cookie 文件设置"
+        return None
+
+    def set_proxy_settings(self, mode: str, address: str) -> str | None:
+        try:
+            if mode not in ("system", "direct", "manual"):
+                return "不支持的代理模式"
+            address = validate_proxy_url(address) if mode == "manual" else ""
+        except ValueError as exc:
+            return str(exc)
+        previous = self.proxy_mode, self.proxy_url
+        if previous == (mode, address):
+            return None
+        self.proxy_mode, self.proxy_url = mode, address
+        if not self._save():
+            self.proxy_mode, self.proxy_url = previous
+            return "无法保存代理设置"
+        set_proxy(mode, address)
+        return None
+
     def _refresh_cache_settings(self):
         if self._settings_dialog is None:
             return
@@ -1264,6 +1395,12 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.import_entry(dialog.value())
 
+    def _source_client(self, entry):
+        if entry.provider == "youtube":
+            return YouTubeClient(use_chrome=self.youtube_use_chrome and not self.youtube_use_cookie_file,
+                                 cookie_file=self.youtube_cookie_file if self.youtube_use_cookie_file else None)
+        return BilibiliClient()
+
     def import_entry(self, entry: LibraryEntry):
         self._status("正在导入 {title}…", title=entry.title or entry.bvid)
 
@@ -1283,7 +1420,7 @@ class MainWindow(QMainWindow):
             self._save()
             self._status("已导入 {title}", title=imported.title)
 
-        self._submit(lambda: BilibiliClient().get_video(entry), done)
+        self._submit(lambda: self._source_client(entry).get_video(entry), done)
 
     def new_album(self, _checked=False, title: str | None = None):
         if title is None:
@@ -1318,7 +1455,7 @@ class MainWindow(QMainWindow):
         if entry.resolved:
             done(entry)
             return
-        source = (entry.bvid, entry.page, entry.kind)
+        source = (entry.provider, entry.bvid, entry.page, entry.kind)
         was_present = self._find(entry.id) is not None
         self._status("正在读取 {title}…", title=entry.title)
 
@@ -1328,7 +1465,7 @@ class MainWindow(QMainWindow):
                 if was_present:
                     return
                 current = entry
-            if source != (current.bvid, current.page, current.kind):
+            if source != (current.provider, current.bvid, current.page, current.kind):
                 return
             if not current.resolved:
                 tracks = copy_tracks(info.tracks)
@@ -1349,7 +1486,7 @@ class MainWindow(QMainWindow):
                     self._render_library()
             done(current)
 
-        self._submit(lambda: BilibiliClient().get_video(entry), loaded, failed)
+        self._submit(lambda: self._source_client(entry).get_video(entry), loaded, failed)
 
     def _dialog_host(self):
         dialog = QApplication.activeModalWidget()
@@ -1484,11 +1621,13 @@ class MainWindow(QMainWindow):
             if canonical is None:
                 canonical = replace(candidate, id=song.id, song_id=song.id)
             else:
+                canonical.provider = candidate.provider
                 canonical.bvid, canonical.cid, canonical.page = candidate.bvid, candidate.cid, candidate.page
                 canonical.duration = candidate.duration
             canonical.title, canonical.artist, canonical.date = updated.title, updated.artist, updated.date
             canonical.id = canonical.song_id = song.id
             song.tracks = [canonical]
+        song.provider = updated.provider
         song.title, song.bvid, song.page = updated.title, updated.bvid, updated.page
         song.artist, song.date, song.cover = updated.artist, updated.date, updated.cover
         song.resolved = updated.resolved
@@ -1532,7 +1671,7 @@ class MainWindow(QMainWindow):
         revision = self._song_edit_requests.get(current.id, 0) + 1
         self._song_edit_requests[current.id] = revision
         updated.kind = "single"
-        if (updated.bvid, updated.page) != (current.bvid, current.page):
+        if (updated.provider, updated.bvid, updated.page) != (current.provider, current.bvid, current.page):
             # Validate the replacement before changing the shared song entity.
             def loaded(info):
                 if self._song_edit_requests.get(current.id) != revision:
@@ -1541,7 +1680,7 @@ class MainWindow(QMainWindow):
                 updated.cover = updated.cover or info.cover
                 updated.resolved = True
                 self._commit_song_edit(current, updated)
-            self._submit(lambda: BilibiliClient().get_video(updated), loaded)
+            self._submit(lambda: self._source_client(updated).get_video(updated), loaded)
         else:
             updated.tracks = list(current.tracks)
             self._commit_song_edit(current, updated)
@@ -1614,7 +1753,8 @@ class MainWindow(QMainWindow):
         action("copy", "复制", lambda: self.copy_library_entries([entry.id]))
         if entry.kind == "single":
             action("add_album", "加入专辑…", lambda: self._choose_album(entry))
-        web = action("source", "在 B站打开", lambda: QDesktopServices.openUrl(QUrl(f"https://www.bilibili.com/video/{entry.bvid}/")))
+        web = action("source", "在 YouTube 打开" if entry.provider == "youtube" else "在 B站打开",
+                     lambda: QDesktopServices.openUrl(QUrl(entry.video_url)))
         web.setEnabled(bool(entry.bvid))
         menu.addSeparator()
         action("delete", "从音乐库删除", lambda: self.delete_entry(entry))
@@ -1761,7 +1901,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _audio_cache_identity(track):
-        return track.song_id or track.id, f"bilibili:{track.bvid}:{track.cid}:{track.page}:best-audio-v1"
+        return track.song_id or track.id, f"{track.provider}:{track.bvid}:{track.cid}:{track.page}:best-audio-v1"
 
     def _load_stream(self, track):
         request = self._request
@@ -1800,7 +1940,7 @@ class MainWindow(QMainWindow):
         if cached_url is not None:
             ready(cached_url, cached=True)
             return
-        self._submit(lambda: BilibiliClient().get_stream(track), done, failed)
+        self._submit(lambda: self._source_client(track).get_stream(track), done, failed)
 
     def _resume_stream(self):
         if self._resume_position is not None and self.player.isSeekable():
@@ -1967,6 +2107,7 @@ class MainWindow(QMainWindow):
             if position != self._last_played_position:
                 self._last_progress_at = time.monotonic()
             self._last_played_position = position
+        self.mini_lyrics.set_position(position)
         for slider, elapsed in ((self.seek, self.elapsed), (self.mini_seek, self.mini_elapsed)):
             if not slider.isSliderDown():
                 slider.setValue(position)
@@ -2018,7 +2159,10 @@ class MainWindow(QMainWindow):
             self.store.save(self.entries, self._tracks(), self.volume.value(),
                             {"theme": self.theme, "language": self.language, "card_scale": self.card_scale,
                              "play_mode": self.mode.currentIndex(), "audio_output_id": self.audio_output_id,
-                             "mini_cover_style": self.mini_cover_style})
+                             "mini_cover_style": self.mini_cover_style, "proxy_mode": self.proxy_mode,
+                             "proxy_url": self.proxy_url, "youtube_use_chrome": self.youtube_use_chrome,
+                             "youtube_use_cookie_file": self.youtube_use_cookie_file,
+                             "youtube_cookie_file": self.youtube_cookie_file})
             return True
         except (ValueError, OSError) as exc:
             self._status("保存失败：{message}", message=translate_error(str(exc), self.language))

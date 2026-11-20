@@ -6,19 +6,20 @@ from uuid import uuid4
 from .models import LibraryEntry, Track
 
 
-Source = tuple[str, int]
+Source = tuple[str, str, int]
 
 
-def _source(track: Track) -> Source:
-    return track.bvid, track.page
+def _source(item: Track | LibraryEntry) -> Source:
+    return item.provider, item.bvid, item.page
 
 
 def _single_source(entry: LibraryEntry) -> Source:
-    requested = entry.bvid, entry.page
-    if not entry.tracks or any(_source(track) == requested for track in entry.tracks):
+    requested = _source(entry)
+    if any(_source(track) == requested for track in entry.tracks):
         return requested
-    # Old edited snapshots can retain a stale card page/source.
-    return _source(entry.tracks[0])
+    # Old edited snapshots can retain a stale card page/source within the same provider.
+    return next((_source(track) for track in entry.tracks if track.provider == entry.provider),
+                requested)
 
 
 def _validate_entries(entries: object) -> None:
@@ -63,8 +64,8 @@ def _normalize_legacy(entries: list[LibraryEntry]) -> list[LibraryEntry]:
             while identifier in used_ids:
                 identifier = str(uuid4())
             used_ids.add(identifier)
-            song = LibraryEntry(track.title, source[0], page=source[1], id=identifier,
-                                artist=track.artist, date=track.date)
+            song = LibraryEntry(track.title, track.bvid, page=track.page, id=identifier,
+                                artist=track.artist, date=track.date, provider=track.provider)
             appended.append(song)
 
         aliases = set(getattr(song, "_song_aliases", ()))
@@ -102,7 +103,7 @@ def _normalize_legacy(entries: list[LibraryEntry]) -> list[LibraryEntry]:
         if not song.cover:
             song.cover = next((owner.cover for owner in [*owners, *(item[0] for item in copies)]
                                if owner.cover), "")
-        song.bvid, song.page = source
+        song.provider, song.bvid, song.page = source
         if track is not None:
             if not track.duration:
                 track.duration = next((candidate.duration for _, candidate in ordered
@@ -190,7 +191,8 @@ def normalize_library(entries: list[LibraryEntry]) -> list[LibraryEntry]:
                 raise ValueError("专辑曲目引用了专辑 ID")
             if identifier not in songs:
                 song = LibraryEntry(track.title, track.bvid, page=track.page, id=identifier,
-                                    artist=track.artist, date=track.date, cover=folder.cover)
+                                    artist=track.artist, date=track.date, cover=folder.cover,
+                                    provider=track.provider)
                 songs[identifier] = by_id[identifier] = song
                 candidates[identifier] = []
             candidates[identifier].append(track)
@@ -228,7 +230,7 @@ def normalize_library(entries: list[LibraryEntry]) -> list[LibraryEntry]:
                 track.duration = next((candidate.duration for candidate in options if candidate.duration), 0)
             # The owner ID is authoritative even for freshly resolved API tracks.
             track.id = track.song_id = identifier
-            song.bvid, song.page = track.bvid, track.page
+            song.provider, song.bvid, song.page = _source(track)
             song.tracks[:] = [track]
             song.resolved = True
         else:
@@ -403,7 +405,7 @@ def decode_library(payload: dict) -> list[LibraryEntry]:
                 if entry.tracks:
                     track = entry.tracks[0]
                     if (track.id != entry.id or track.song_id != entry.id
-                            or _source(track) != (entry.bvid, entry.page)):
+                            or _source(track) != _source(entry)):
                         raise ValueError("标准单曲 ID 或来源不一致")
             entries.append(entry)
             if refs is not None:
@@ -412,7 +414,7 @@ def decode_library(payload: dict) -> list[LibraryEntry]:
             songs = {entry.id: entry for entry in entries if entry.kind == "single"}
             sources: set[Source] = set()
             for song in songs.values():
-                source = song.bvid, song.page
+                source = _source(song)
                 if version == 3 and source in sources:
                     raise ValueError("标准单曲来源重复")
                 sources.add(source)

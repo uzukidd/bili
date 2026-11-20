@@ -1,8 +1,10 @@
 """Scrollable entry details and explicit per-track actions."""
 from __future__ import annotations
 
+from inspect import getattr_static
+
 from PyQt6 import sip
-from PyQt6.QtCore import QEvent, QItemSelectionModel, QPointF, QRectF, QSize, Qt
+from PyQt6.QtCore import QEvent, QItemSelectionModel, QPointF, QRectF, QSignalBlocker, QSize, Qt
 from PyQt6.QtGui import QKeySequence, QMouseEvent, QPainter, QPainterPath, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
@@ -245,6 +247,14 @@ class EntryDetailsDialog(QDialog):
         self.empty_label = self._label(self.tr("这个专辑还没有歌曲，先添加几首吧。"), "muted")
         self.empty_label.setWordWrap(True)
         content_layout.addWidget(self.empty_label)
+        self.lyrics_section = None
+        if is_single and all(callable(getattr_static(self._owner, name, None)) for name in (
+            "song_lyrics", "save_song_lyrics", "set_active_lyrics",
+        )):
+            self._build_lyrics_section(content_layout)
+            lyrics_changed = getattr(self._owner, "lyricsChanged", None)
+            if lyrics_changed is not None:
+                lyrics_changed.connect(self._on_lyrics_changed)
         content_layout.addStretch()
         self.scroll_area.setWidget(self.content)
         layout.addWidget(self.scroll_area, 1)
@@ -270,7 +280,8 @@ class EntryDetailsDialog(QDialog):
         self.refresh()
         if is_single:
             self.ensurePolished()
-            self.scroll_area.setMinimumHeight(self.hero.height() + 2 * self.scroll_area.frameWidth())
+            lyrics_height = 132 if self.lyrics_section is not None else 0
+            self.scroll_area.setMinimumHeight(self.hero.height() + lyrics_height + 2 * self.scroll_area.frameWidth())
             window_layout.activate()
             self.resize(700, window_layout.minimumSize().height())
         changed = getattr(parent, "libraryChanged", None)
@@ -293,6 +304,105 @@ class EntryDetailsDialog(QDialog):
         widget.setCursor(Qt.CursorShape.PointingHandCursor)
         widget.clicked.connect(callback)
         return widget
+
+    def _build_lyrics_section(self, content_layout):
+        self.lyrics_section = QWidget()
+        layout = QVBoxLayout(self.lyrics_section)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        heading = QHBoxLayout()
+        heading.addWidget(self._label(self.tr("歌词"), "section"))
+        heading.addStretch()
+        self.add_lyrics_button = self._button("+", self._add_lyrics)
+        self.add_lyrics_button.setAccessibleName(self.tr("添加歌词"))
+        self.add_lyrics_button.setToolTip(self.add_lyrics_button.accessibleName())
+        self.add_lyrics_button.setEnabled(callable(getattr(self._owner, "_submit", None)))
+        heading.addWidget(self.add_lyrics_button)
+        layout.addLayout(heading)
+        self.lyrics_list = QListWidget()
+        self.lyrics_list.setAccessibleName(self.tr("歌词"))
+        self.lyrics_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.lyrics_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.lyrics_list.viewport().installEventFilter(self)
+        self.lyrics_list.itemClicked.connect(self._select_lyrics)
+        self.lyrics_list.itemActivated.connect(self._select_lyrics)
+        layout.addWidget(self.lyrics_list)
+        self.no_lyrics_label = self._label(self.tr("暂无已保存歌词"), "muted")
+        layout.addWidget(self.no_lyrics_label)
+        self._active_lyrics_id = None
+        content_layout.addWidget(self.lyrics_section)
+
+    def _refresh_lyrics(self):
+        if self.lyrics_section is None:
+            return
+        is_single = self.entry.kind == "single"
+        self.lyrics_section.setVisible(is_single)
+        if not is_single:
+            return
+        entries, self._active_lyrics_id = self._owner.song_lyrics(self.entry.id)
+        role = Qt.ItemDataRole.UserRole
+        with QSignalBlocker(self.lyrics_list):
+            identities = [self.lyrics_list.item(i).data(role) for i in range(self.lyrics_list.count())]
+            if identities != [lyrics.id for lyrics in entries]:
+                self.lyrics_list.clear()
+                for lyrics in entries:
+                    item = QListWidgetItem()
+                    item.setData(role, lyrics.id)
+                    item.setSizeHint(QSize(0, 38))
+                    self.lyrics_list.addItem(item)
+            active_row = -1
+            for row, lyrics in enumerate(entries):
+                name = f"{lyrics.title} · {lyrics.artist}" if lyrics.artist else lyrics.title
+                if lyrics.id == self._active_lyrics_id:
+                    name = f"{self.tr('当前歌词')} · {name}"
+                    active_row = row
+                item = self.lyrics_list.item(row)
+                item.setText(name)
+                item.setToolTip(name)
+            self.lyrics_list.setCurrentRow(active_row, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            if active_row == -1:
+                self.lyrics_list.clearSelection()
+        self.lyrics_list.setFixedHeight(sum(self.lyrics_list.sizeHintForRow(i) for i in range(len(entries)))
+                                        + 2 * self.lyrics_list.frameWidth() + 4)
+        self.lyrics_list.setVisible(bool(entries))
+        self.no_lyrics_label.setVisible(not entries)
+
+    def _on_lyrics_changed(self, song_id):
+        if song_id == self.entry.id:
+            self._refresh_lyrics()
+
+    def _select_lyrics(self, item):
+        identity = item.data(Qt.ItemDataRole.UserRole)
+        if identity == self._active_lyrics_id:
+            return
+        entry = self._current_entry()
+        if entry is not None and entry.kind == "single":
+            self._owner.set_active_lyrics(entry.id, identity)
+            if not sip.isdeleted(self) and self._active_lyrics_id != identity:
+                self._refresh_lyrics()
+
+    def _add_lyrics(self):
+        entry = self._current_entry()
+        submit = getattr(self._owner, "_submit", None)
+        if entry is None or entry.kind != "single" or not callable(submit):
+            return
+        from .lyrics_dialog import LyricsSearchDialog
+
+        title = entry.title or (entry.tracks[0].title if entry.tracks else "")
+        dialog = LyricsSearchDialog(self, title, submit=submit, language=self.language)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted or sip.isdeleted(dialog):
+                return
+            selected = dialog.selected_lyrics
+        finally:
+            if not sip.isdeleted(dialog):
+                dialog.deleteLater()
+        if selected is not None and not sip.isdeleted(self):
+            current = self._current_entry()
+            if current is not None and current.kind == "single" and current.id == entry.id:
+                self._owner.save_song_lyrics(entry.id, selected)
+                if not sip.isdeleted(self) and self._active_lyrics_id != selected.id:
+                    self._refresh_lyrics()
 
     def eventFilter(self, watched, event):
         if event.type() == QEvent.Type.ContextMenu and watched is self.tracks_list.viewport():
@@ -344,7 +454,8 @@ class EntryDetailsDialog(QDialog):
             else:
                 current = LibraryEntry(track.title, track.bvid, page=track.page, id=track.id,
                                        tracks=[track], cover=album.cover, resolved=True,
-                                       artist=track.artist, date=track.date) if track else None
+                                       artist=track.artist, date=track.date,
+                                       provider=track.provider) if track else None
         else:
             current = find(self.entry.id) if callable(find) else self.entry
         if current is None:
@@ -388,13 +499,17 @@ class EntryDetailsDialog(QDialog):
             self.artist_label.setVisible(bool(artist_text))
             self.date_label.setText(self.tr("日期：{date}", date=date) if date else "")
             self.date_label.setVisible(bool(date))
-        self.source_label.setText(self.tr("来源：{bvid}", bvid=entry.bvid) if entry.bvid else "")
-        self.source_label.setVisible(bool(entry.bvid))
+        source = f"YouTube · {entry.bvid}" if entry.provider == "youtube" else entry.bvid
+        self.source_label.setText(self.tr("来源：{bvid}", bvid=source) if source else "")
+        self.source_label.setVisible(bool(source))
         self.tracks_list.clear()
         self.track_rows = []
         for index, track in enumerate(entry.tracks if not is_single else [], 1):
             title = track.title or (entry.title if entry.kind == "single" else track.bvid)
-            metadata = " · ".join(part for part in (track.artist.strip(), _duration(track.duration)) if part)
+            metadata = " · ".join(part for part in (
+                track.artist.strip(), _duration(track.duration),
+                "YouTube" if track.provider == "youtube" else "",
+            ) if part)
             item = QListWidgetItem(f"{index}.  {title}\n{metadata}")
             item.setData(Qt.ItemDataRole.UserRole, track)
             item.setSizeHint(QSize(0, 114))
@@ -411,6 +526,7 @@ class EntryDetailsDialog(QDialog):
         self.track_heading.setVisible(not is_single)
         self._update_selection_controls()
         self.empty_label.setVisible(not is_single and not entry.tracks)
+        self._refresh_lyrics()
         self.copy_button.setEnabled(True)
         self.edit_button.setEnabled(True)
         self.play_button.setEnabled(bool(entry.tracks))

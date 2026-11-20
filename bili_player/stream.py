@@ -12,8 +12,10 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import requests
+from requests import RequestException, Response
+from requests.structures import CaseInsensitiveDict
 
+from . import network as requests
 from .api import HEADERS
 from .audio_cache import AudioCache, BLOCK_SIZE, CacheEntry
 
@@ -28,6 +30,7 @@ class UpstreamError(OSError):
 class _Stream:
     url: str
     entry: CacheEntry | None = None
+    http_headers: dict[str, str] | None = None
     cancelled: threading.Event = field(default_factory=threading.Event)
     progress_at: float = 0.0
 
@@ -76,7 +79,7 @@ class StreamProxy:
         self._streams: dict[str, _Stream] = {}
         self._closed = threading.Event()
         self._connections: set[socket.socket] = set()
-        self._responses: dict[requests.Response, _Stream] = {}
+        self._responses: dict[Response, _Stream] = {}
         self._cache = (AudioCache(cache_directory, max_cache_bytes, target_cache_bytes)
                        if cache_directory is not None else None)
         owner = self
@@ -206,7 +209,7 @@ class StreamProxy:
                         self._write(stream, data)
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass
-                except (requests.RequestException, OSError, ValueError, StopIteration) as exc:
+                except (RequestException, OSError, ValueError, StopIteration) as exc:
                     if stream and not stream.cancelled.is_set() and not owner._closed.is_set():
                         # Do not log signed upstream URLs or response credentials.
                         detail = str(exc) if isinstance(exc, UpstreamError) else type(exc).__name__
@@ -227,7 +230,7 @@ class StreamProxy:
                     self.close_connection = True
 
             def _relay(self, stream, head):
-                headers = {**HEADERS, "Accept-Encoding": "identity"}
+                headers = {"Accept-Encoding": "identity"}
                 if self.headers.get("Range"):
                     headers["Range"] = self.headers["Range"]
                 started = False
@@ -247,7 +250,7 @@ class StreamProxy:
                             if chunk:
                                 stream.progress_at = time.monotonic()
                                 self._write(stream, chunk)
-                except (requests.RequestException, OSError):
+                except (RequestException, OSError):
                     if not started:
                         self.send_error(502, "Audio upstream unavailable")
                 finally:
@@ -268,11 +271,13 @@ class StreamProxy:
 
     def _request(self, stream, method, headers, attempts=3):
         self._check(stream)
+        upstream_headers = CaseInsensitiveDict(HEADERS if stream.http_headers is None else stream.http_headers)
+        upstream_headers.update(headers)
         last = None
         for attempt in range(attempts):
             self._check(stream)
             try:
-                response = requests.request(method, stream.url, headers=headers,
+                response = requests.request(method, stream.url, headers=upstream_headers,
                                             stream=True, timeout=(5, 10), allow_redirects=True)
                 if response.status_code in (408, 429, 500, 502, 503, 504) and attempt < attempts - 1:
                     response.close()
@@ -285,7 +290,7 @@ class StreamProxy:
                     if response.status_code in (200, 206):
                         stream.progress_at = time.monotonic()
                     return response
-            except requests.RequestException as exc:
+            except RequestException as exc:
                 last = exc
             if stream.cancelled.wait(0.05 * (attempt + 1)):
                 self._check(stream)
@@ -299,7 +304,7 @@ class StreamProxy:
                 self._responses.pop(response, None)
 
     def _head(self, stream):
-        response = self._request(stream, "HEAD", {**HEADERS, "Accept-Encoding": "identity"})
+        response = self._request(stream, "HEAD", {"Accept-Encoding": "identity"})
         try:
             if response.status_code != 200:
                 return
@@ -324,7 +329,7 @@ class StreamProxy:
         end = start + BLOCK_SIZE - 1
         if entry.size is not None:
             end = min(end, entry.size - 1)
-        headers = {**HEADERS, "Accept-Encoding": "identity", "Range": f"bytes={start}-{end}"}
+        headers = {"Accept-Encoding": "identity", "Range": f"bytes={start}-{end}"}
         if entry.etag and not entry.etag.startswith("W/"):
             headers["If-Range"] = entry.etag
         error = None
@@ -369,7 +374,7 @@ class StreamProxy:
                 result = bytes(data)
                 self._cache.write_block(entry, index, result)
                 return result, None
-            except (requests.RequestException, OSError, ValueError) as exc:
+            except (RequestException, OSError, ValueError) as exc:
                 error = exc
             finally:
                 if response is not None and not (response.status_code == 200 and error is None):
@@ -464,8 +469,9 @@ class StreamProxy:
             self.release_stream()
             if self._closed.is_set():
                 raise RuntimeError("StreamProxy is closed")
+            headers = getattr(url, "http_headers", None)
             entry = self._cache.activate(cache_key, source_key, url) if self._cache and cache_key else None
-            return self._activate(_Stream(url, entry))
+            return self._activate(_Stream(url, entry, dict(headers) if headers is not None else None))
 
     def get_cached_stream(self, cache_key: str, source_key: str) -> str | None:
         with self._lock:

@@ -15,7 +15,28 @@ from PyQt6.QtWidgets import (
 
 from .api import BilibiliClient
 from .i18n import translate
-from .models import LibraryEntry, Track, normalize_bvid
+from .models import LibraryEntry, Track, normalize_bvid, normalize_youtube_id
+from .youtube import YouTubeClient
+
+
+def _client(provider: str, owner) -> BilibiliClient | YouTubeClient:
+    if provider == "youtube":
+        manual = getattr(owner, "youtube_use_cookie_file", False)
+        return YouTubeClient(use_chrome=getattr(owner, "youtube_use_chrome", True) and not manual,
+                             cookie_file=getattr(owner, "youtube_cookie_file", "") if manual else None)
+    return BilibiliClient()
+
+
+def _source_fields(provider: str) -> tuple[str, str, str]:
+    if provider == "youtube":
+        return ("视频 ID / 链接", "YouTube 视频 ID 或链接", "请输入有效的 YouTube 视频 ID 或链接。")
+    return ("BV / 链接", "BV 号或哔哩哔哩视频链接", "请输入有效的 BV 号或哔哩哔哩视频链接。")
+
+
+def _format_source(item: LibraryEntry | Track) -> str:
+    if item.provider == "youtube":
+        return f"YouTube · {item.bvid}"
+    return f"{item.bvid} · P{item.page}"
 
 
 class _Dialog(QDialog):
@@ -62,9 +83,9 @@ class _Dialog(QDialog):
 
 
 class EntryDialog(_Dialog):
-    """Import a BV as a single page or all pages, or edit a saved single."""
+    """Import a video or edit a saved single from its existing source."""
 
-    def __init__(self, parent=None, entry: LibraryEntry | None = None, language=None):
+    def __init__(self, parent=None, entry: LibraryEntry | None = None, language=None, *, bilibili_only=False):
         super().__init__(parent, language)
         self.entry = deepcopy(entry)
         self.setWindowTitle(self.tr("编辑音乐") if entry else self.tr("添加音乐"))
@@ -84,8 +105,15 @@ class EntryDialog(_Dialog):
         self.date_input.setPlaceholderText(self.tr("手动填写日期，例如 2025-01-01（可留空）"))
         self.artist_label = self._label(self.tr("作者"))
         self.date_label = self._label(self.tr("日期"))
+        self.source_input = QComboBox()
+        self.source_input.addItem(self.tr("哔哩哔哩"), "bilibili")
+        if not bilibili_only or (entry is not None and entry.provider == "youtube"):
+            self.source_input.addItem("YouTube", "youtube")
+        if entry is not None:
+            self.source_input.setCurrentIndex(self.source_input.findData(entry.provider))
+            self.source_input.setEnabled(False)
+        self.bvid_label = self._label()
         self.bvid_input = QLineEdit(entry.bvid if entry else "")
-        self.bvid_input.setPlaceholderText(self.tr("BV 号或哔哩哔哩视频链接"))
         self.kind_input = QComboBox()
         self.kind_input.addItem(self.tr("单曲 · 导入指定分 P"), "single")
         self.kind_input.addItem(self.tr("专辑 · 导入全部分 P"), "album")
@@ -106,33 +134,57 @@ class EntryDialog(_Dialog):
             cover_row.addWidget(self.cover_input, 1)
             cover_row.addWidget(self._button("选择图片", lambda: self._choose_cover("选择图片", self.cover_input)))
             form.addRow(self.tr("封面"), cover_row)
-        form.addRow(self.tr("BV / 链接"), self.bvid_input)
+        if not bilibili_only:
+            form.addRow(self.tr("来源"), self.source_input)
+        form.addRow(self.bvid_label, self.bvid_input)
         form.addRow(self.tr("类型"), self.kind_input)
         form.addRow(self.tr("分 P"), self.page_input)
-        self._kind_changed()
+        self.form = form
         layout.addLayout(form)
-        hint = self._label(self.tr("选择专辑会导入该视频的全部分 P。"), "muted")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        self.album_hint = self._label(self.tr("选择专辑会导入该视频的全部分 P。"), "muted")
+        self.album_hint.setWordWrap(True)
+        layout.addWidget(self.album_hint)
         self.error = self._label()
         self.error.setObjectName("dialogError")
         self.error.setWordWrap(True)
         layout.addWidget(self.error)
         self._buttons(layout)
+        self.source_input.currentIndexChanged.connect(self._source_changed)
+        self._source_changed()
+
+    def _source_changed(self, *_):
+        provider = self.source_input.currentData()
+        youtube = provider == "youtube"
+        if youtube:
+            self.kind_input.setCurrentIndex(self.kind_input.findData("single"))
+            self.page_input.setValue(1)
+        self.kind_input.setEnabled(not youtube and (self.entry is None or self.entry.kind != "single"))
+        self.form.setRowVisible(self.kind_input, not youtube)
+        self.form.setRowVisible(self.page_input, not youtube)
+        self.album_hint.setVisible(not youtube)
+        label, placeholder, _ = _source_fields(provider)
+        self.bvid_label.setText(self.tr(label))
+        self.bvid_input.setPlaceholderText(self.tr(placeholder))
+        self.error.clear()
+        self._kind_changed()
 
     def _kind_changed(self, *_):
         single = self.kind_input.currentData() == "single"
-        self.page_input.setEnabled(single)
+        self.page_input.setEnabled(single and self.source_input.currentData() != "youtube")
         for widget in (self.artist_input, self.artist_label, self.date_input, self.date_label):
             widget.setVisible(single)
 
     def value(self) -> LibraryEntry:
-        bvid = normalize_bvid(self.bvid_input.text())
+        provider = self.entry.provider if self.entry is not None else self.source_input.currentData()
+        youtube = provider == "youtube"
+        normalize = normalize_youtube_id if youtube else normalize_bvid
+        bvid = normalize(self.bvid_input.text())
         changes = {
             "title": self.title_input.text().strip() or bvid,
             "bvid": bvid,
-            "kind": self.kind_input.currentData(),
-            "page": self.page_input.value(),
+            "provider": provider,
+            "kind": "single" if youtube else self.kind_input.currentData(),
+            "page": 1 if youtube else self.page_input.value(),
         }
         if changes["kind"] == "single":
             changes.update(
@@ -140,8 +192,8 @@ class EntryDialog(_Dialog):
             )
         if self.entry is None:
             return LibraryEntry(**changes)
-        if (bvid, changes["page"], changes["kind"]) != (
-            self.entry.bvid, self.entry.page, self.entry.kind,
+        if (provider, bvid, changes["page"], changes["kind"]) != (
+            self.entry.provider, self.entry.bvid, self.entry.page, self.entry.kind,
         ):
             changes.update(tracks=[], cover="", resolved=False)
         if self.cover_input is not None:
@@ -154,7 +206,8 @@ class EntryDialog(_Dialog):
         try:
             self.value()
         except ValueError:
-            self.error.setText(self.tr("请输入有效的 BV 号或哔哩哔哩视频链接。"))
+            provider = self.entry.provider if self.entry is not None else self.source_input.currentData()
+            self.error.setText(self.tr(_source_fields(provider)[2]))
             self.bvid_input.setFocus()
             return
         self.error.clear()
@@ -162,7 +215,7 @@ class EntryDialog(_Dialog):
 
 
 class TrackDialog(_Dialog):
-    """Edit metadata locally; the album resolves a changed BV/page asynchronously."""
+    """Edit metadata locally; the album resolves a changed source asynchronously."""
 
     def __init__(self, parent, track: Track, language=None):
         super().__init__(parent, language)
@@ -176,18 +229,24 @@ class TrackDialog(_Dialog):
         self.artist_input.setPlaceholderText(self.tr("手动填写作者（可留空）"))
         self.date_input = QLineEdit(track.date)
         self.date_input.setPlaceholderText(self.tr("手动填写日期，例如 2025-01-01（可留空）"))
+        youtube = track.provider == "youtube"
+        label, placeholder, self._invalid_source = _source_fields(track.provider)
         self.bvid_input = QLineEdit(track.bvid)
-        self.bvid_input.setPlaceholderText(self.tr("BV 号或哔哩哔哩视频链接"))
+        self.bvid_input.setPlaceholderText(self.tr(placeholder))
         self.page_input = QSpinBox()
         self.page_input.setRange(1, 10000)
         self.page_input.setValue(track.page)
+        self.page_input.setEnabled(not youtube)
         form.addRow(self.tr("曲目名称"), self.title_input)
         form.addRow(self.tr("作者"), self.artist_input)
         form.addRow(self.tr("日期"), self.date_input)
-        form.addRow(self.tr("BV / 链接"), self.bvid_input)
-        form.addRow(self.tr("分 P"), self.page_input)
+        form.addRow(self.tr(label), self.bvid_input)
+        if not youtube:
+            form.addRow(self.tr("分 P"), self.page_input)
         layout.addLayout(form)
-        hint = self._label(self.tr("更改 BV 或分 P 后会重新读取音频信息。"), "muted")
+        hint = self._label(self.tr(
+            "更改视频 ID 后会重新读取音频信息。" if youtube else "更改 BV 或分 P 后会重新读取音频信息。",
+        ), "muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
         self.error = self._label()
@@ -200,10 +259,12 @@ class TrackDialog(_Dialog):
         title = self.title_input.text().strip()
         if not title:
             raise ValueError(self.tr("请输入曲目名称。"))
+        youtube = self.track.provider == "youtube"
+        normalize = normalize_youtube_id if youtube else normalize_bvid
         return replace(
-            deepcopy(self.track), title=title, artist=self.artist_input.text().strip(),
+            self.track, title=title, artist=self.artist_input.text().strip(),
             date=self.date_input.text().strip(),
-            bvid=normalize_bvid(self.bvid_input.text()), page=self.page_input.value(),
+            bvid=normalize(self.bvid_input.text()), page=1 if youtube else self.page_input.value(),
         )
 
     def accept(self):
@@ -214,7 +275,7 @@ class TrackDialog(_Dialog):
         try:
             self.value()
         except ValueError:
-            self.error.setText(self.tr("请输入有效的 BV 号或哔哩哔哩视频链接。"))
+            self.error.setText(self.tr(self._invalid_source))
             self.bvid_input.setFocus()
             return
         self.error.clear()
@@ -232,7 +293,7 @@ class _SinglesDialog(_Dialog):
         layout.addWidget(hint)
         self.singles_list = QListWidget()
         for entry in singles:
-            item = QListWidgetItem(f"{entry.title}\n{entry.bvid} · P{entry.page}")
+            item = QListWidgetItem(f"{entry.title}\n{_format_source(entry)}")
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, deepcopy(entry))
@@ -364,8 +425,9 @@ class AlbumDialog(_Dialog):
     def _format_item(self, item: QListWidgetItem, track: Track):
         item.setData(Qt.ItemDataRole.UserRole, track)
         artist = track.artist or self.tr("未知艺术家")
-        item.setText(f"{track.title}\n{artist} · {track.bvid} · P{track.page}")
-        item.setToolTip(f"{track.title}\n{artist}\n{track.bvid} · P{track.page}")
+        source = _format_source(track)
+        item.setText(f"{track.title}\n{artist} · {source}")
+        item.setToolTip(f"{track.title}\n{artist}\n{source}")
 
     def _append_track(self, track: Track):
         item = QListWidgetItem()
@@ -480,7 +542,7 @@ class AlbumDialog(_Dialog):
         return [replace(deepcopy(track), **changes) for track in tracks]
 
     def add_bv(self, *_):
-        dialog = EntryDialog(self, language=self.language)
+        dialog = EntryDialog(self, language=self.language, bilibili_only=True)
         if dialog.exec() != QDialog.DialogCode.Accepted or not self._alive:
             return
         source = dialog.value()
@@ -513,7 +575,7 @@ class AlbumDialog(_Dialog):
                     resolved = [replace(deepcopy(track), song_id=entry.id) for track in entry.tracks]
                 else:
                     resolved = [replace(track, id=entry.id, song_id=entry.id)
-                                for track in BilibiliClient().get_tracks(entry)]
+                                for track in _client(entry.provider, self._owner).get_tracks(entry)]
                 tracks.extend(self._single_title(entry, resolved))
             return tracks
 
@@ -556,15 +618,16 @@ class AlbumDialog(_Dialog):
                     self._format_item(item, track)
                     break
 
-        if (edited.bvid, edited.page) == (original.bvid, original.page):
+        if (edited.provider, edited.bvid, edited.page) == (original.provider, original.bvid, original.page):
             apply(edited)
             return
         source = LibraryEntry(
             title=edited.title, bvid=edited.bvid, kind="single", page=edited.page,
+            provider=edited.provider,
         )
 
         def load():
-            tracks = BilibiliClient().get_tracks(source)
+            tracks = _client(source.provider, self._owner).get_tracks(source)
             if not tracks:
                 raise ValueError(self.tr("这个视频没有可播放的分 P。"))
             return replace(

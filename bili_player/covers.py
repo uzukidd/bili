@@ -7,9 +7,9 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
-import requests
 from PyQt6.QtGui import QImage
 
+from . import network as requests
 from .api import HEADERS
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024

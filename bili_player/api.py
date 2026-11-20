@@ -6,6 +6,7 @@ from typing import Any
 
 import requests
 
+from . import network
 from .models import LibraryEntry, Track
 
 
@@ -33,7 +34,7 @@ class VideoInfo:
 
 class BilibiliClient:
     def __init__(self, session: requests.Session | None = None, timeout: float = 15):
-        self.session = session if session is not None else requests.Session()
+        self.session = session if session is not None else network.Session()
         self.session.headers.update(HEADERS)
         self.timeout = timeout
 
