@@ -66,6 +66,10 @@ QListWidget { background: PANEL; border: none; border-radius: 8px; outline: none
 QListWidget::item { padding: 10px 6px; margin: 2px 0; border-radius: 7px; }
 QListWidget::item:selected { background: SOFT; color: TEXT; }
 QListWidget::item:hover { background: SOFT; }
+QListWidget#miniLyrics { border: 1px solid LINE; border-radius: 9px; }
+QListWidget#miniLyrics::item { font-size: 15px; color: MUTED; padding: 8px 12px; }
+QListWidget#miniLyrics::item:hover { background: transparent; }
+QListWidget#miniLyrics::item:selected { background: SOFT; color: TEXT; font-weight: 700; }
 QListWidget::indicator { width: 16px; height: 16px; }
 QSlider::groove:horizontal { height: 4px; background: LINE; border-radius: 2px; }
 QSlider::sub-page:horizontal { background: ACCENT; border-radius: 2px; }

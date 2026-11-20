@@ -72,6 +72,43 @@ class SettingsTests(unittest.TestCase):
         store.load()
         self.assertEqual((store.settings["theme"], store.settings["language"]), ("dark", "en_US"))
 
+    def test_youtube_session_defaults_to_chrome_and_anonymous_choice_persists(self):
+        from bili_player.models import LibraryEntry
+
+        dialog = SettingsDialog(self.window)
+        dialog.refresh_preferences()
+        self.assertIs(dialog.youtube_session_combo.currentData(), True)
+        dialog.youtube_session_combo.setCurrentIndex(1)
+        dialog.youtube_session_combo.activated.emit(1)
+        reopened = MainWindow(self.path)
+        self.addCleanup(self.close_window, reopened)
+        entry = LibraryEntry("Video", "BaW_jenozKc", provider="youtube")
+        self.assertFalse(reopened._source_client(entry).use_chrome)
+
+    def test_proxy_applies_only_after_validation_and_persists_on_reopen(self):
+        from bili_player.network import proxy_for_url
+
+        dialog = self.window._settings_dialog = SettingsDialog(self.window)
+        dialog.refresh_preferences()
+        self.assertEqual(dialog.proxy_combo.currentData(), "system")
+        self.assertFalse(dialog.proxy_address.isEnabled())
+        dialog.proxy_combo.setCurrentIndex(dialog.proxy_combo.findData("manual"))
+        self.assertTrue(dialog.proxy_address.isEnabled())
+        dialog.proxy_address.setText("https://user:pass@localhost:7890")
+        dialog.proxy_apply.click()
+        self.assertEqual(self.window.proxy_mode, "system")
+        self.assertIn("代理地址", dialog.proxy_status.text())
+        dialog.proxy_address.setText("  http://127.0.0.1:7890/  ")
+        dialog.proxy_apply.click()
+        self.assertEqual(dialog.proxy_address.text(), "http://127.0.0.1:7890")
+        self.assertEqual(proxy_for_url("https://www.youtube.com/"), "http://127.0.0.1:7890")
+        self.assertIsNone(proxy_for_url("http://127.0.0.1:4567/audio"))
+        reopened = MainWindow(self.path)
+        self.addCleanup(self.close_window, reopened)
+        self.assertEqual((reopened.proxy_mode, reopened.proxy_url), ("manual", "http://127.0.0.1:7890"))
+        self.assertIsNone(reopened.set_proxy_settings("direct", ""))
+        self.assertIsNone(proxy_for_url("https://www.youtube.com/"))
+
     def test_mini_style_previews_select_and_restore_saved_style(self):
         dialog = self.window._settings_dialog = SettingsDialog(self.window)
         dialog.refresh_preferences()

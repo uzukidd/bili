@@ -2,7 +2,7 @@ from PyQt6.QtCore import QSize, QSignalBlocker, Qt
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QButtonGroup, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
-    QPushButton, QSizePolicy, QToolButton, QVBoxLayout,
+    QLineEdit, QPushButton, QSizePolicy, QToolButton, QVBoxLayout,
 )
 
 from .mini_cover import mini_cover_preview
@@ -37,6 +37,36 @@ class SettingsDialog(QDialog):
         layout.addLayout(form)
         self.output_hint = self._muted_label()
         layout.addWidget(self.output_hint)
+
+        self.proxy_label = QLabel()
+        self.proxy_combo = QComboBox()
+        for mode in ("system", "direct", "manual"):
+            self.proxy_combo.addItem("", mode)
+        self.proxy_combo.setCurrentIndex(self.proxy_combo.findData(owner.proxy_mode))
+        self.proxy_address = QLineEdit(owner.proxy_url)
+        self.proxy_address.setPlaceholderText("http://127.0.0.1:7890")
+        self.proxy_apply = QPushButton()
+        self.proxy_apply.setAutoDefault(False)
+        self.proxy_apply.clicked.connect(self._apply_proxy)
+        self.proxy_address.returnPressed.connect(self._apply_proxy)
+        proxy_row = QHBoxLayout()
+        proxy_row.addWidget(self.proxy_address, 1)
+        proxy_row.addWidget(self.proxy_apply)
+        form.addRow(self.proxy_label, self.proxy_combo)
+        form.addRow("", proxy_row)
+        self.youtube_session_label = QLabel()
+        self.youtube_session_combo = QComboBox()
+        self.youtube_session_combo.addItem("", True)
+        self.youtube_session_combo.addItem("", False)
+        self.youtube_session_combo.activated.connect(
+            lambda: owner.set_youtube_use_chrome(self.youtube_session_combo.currentData()))
+        form.addRow(self.youtube_session_label, self.youtube_session_combo)
+        self.proxy_status = self._muted_label()
+        layout.addWidget(self.proxy_status)
+        self._proxy_result = ""
+        self.proxy_combo.currentIndexChanged.connect(self._proxy_inputs_changed)
+        self.proxy_address.textEdited.connect(self._proxy_inputs_changed)
+        self._proxy_inputs_changed()
 
         self.mini_cover_label = QLabel()
         self.mini_cover_label.setObjectName("section")
@@ -93,12 +123,43 @@ class SettingsDialog(QDialog):
         label.setWordWrap(True)
         return label
 
+    def _proxy_inputs_changed(self):
+        self._proxy_result = ""
+        self.proxy_address.setEnabled(self.proxy_combo.currentData() == "manual")
+        self.proxy_status.clear()
+        self.proxy_status.hide()
+
+    def _apply_proxy(self):
+        result = self.owner.set_proxy_settings(self.proxy_combo.currentData(), self.proxy_address.text())
+        if result is None:
+            self.proxy_address.setText(self.owner.proxy_url)
+            self._proxy_result = "代理设置已应用"
+        else:
+            self._proxy_result = result
+        self._refresh_proxy_status()
+
+    def _refresh_proxy_status(self):
+        self.proxy_status.setText(self.owner.tr(self._proxy_result) if self._proxy_result else "")
+        self.proxy_status.setVisible(bool(self._proxy_result))
+
     def refresh_preferences(self):
         tr = self.owner.tr
         self.setWindowTitle(tr("设置"))
         self.theme_label.setText(tr("主题"))
         self.language_label.setText(tr("语言"))
         self.output_label.setText(tr("音频输出设备"))
+        self.proxy_label.setText(tr("网络代理"))
+        self.proxy_combo.setAccessibleName(self.proxy_label.text())
+        self.proxy_address.setAccessibleName(tr("代理地址"))
+        for index, text in enumerate(("系统代理", "直连", "手动代理")):
+            self.proxy_combo.setItemText(index, tr(text))
+        self.proxy_apply.setText(tr("应用"))
+        self.youtube_session_label.setText(tr("YouTube 登录会话"))
+        self.youtube_session_combo.setAccessibleName(self.youtube_session_label.text())
+        self.youtube_session_combo.setItemText(0, tr("使用 Chrome 登录会话"))
+        self.youtube_session_combo.setItemText(1, tr("匿名访问"))
+        self.youtube_session_combo.setCurrentIndex(0 if self.owner.youtube_use_chrome else 1)
+        self._refresh_proxy_status()
         self.theme_combo.setAccessibleName(self.theme_label.text())
         self.language_combo.setAccessibleName(self.language_label.text())
         self.output_combo.setAccessibleName(self.output_label.text())

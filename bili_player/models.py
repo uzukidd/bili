@@ -7,7 +7,7 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 from uuid import uuid4
 
 
@@ -15,6 +15,9 @@ DEFAULT_VOLUME = 70
 MINI_COVER_STYLES = ("classic", "record")
 DEFAULT_MINI_COVER_STYLE = MINI_COVER_STYLES[0]
 _BVID = re.compile(r"BV[0-9A-Za-z]{10}", re.IGNORECASE)
+_YOUTUBE_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+_YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
+_INVALID_YOUTUBE_ID = "请输入有效的 YouTube 视频 ID 或链接"
 _DEFAULT_SETTINGS = {"theme": "light", "language": "zh_CN"}
 
 
@@ -38,6 +41,63 @@ def normalize_bvid(text: str) -> str:
     return "BV" + match.group(1)[2:]
 
 
+def normalize_youtube_id(text: str) -> str:
+    """Extract a YouTube video ID from a supported URL without following redirects."""
+    if not isinstance(text, str):
+        raise ValueError(_INVALID_YOUTUBE_ID)
+    value = text.strip()
+    if _YOUTUBE_ID.fullmatch(value):
+        return value
+    if not value or any(character.isspace() or ord(character) < 32 for character in value):
+        raise ValueError(_INVALID_YOUTUBE_ID)
+    if value.startswith("//"):
+        value = "https:" + value
+    elif "://" not in value:
+        value = "https://" + value
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise ValueError(_INVALID_YOUTUBE_ID) from exc
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(_INVALID_YOUTUBE_ID)
+    # Compare the entire authority so credentials, extra domains and ports are rejected.
+    host = parsed.netloc.lower()
+    if host == "youtu.be":
+        match = re.fullmatch(r"/([A-Za-z0-9_-]{11})/?", parsed.path)
+    elif host in _YOUTUBE_HOSTS:
+        if parsed.path in ("/watch", "/watch/"):
+            ids = parse_qs(parsed.query, keep_blank_values=True).get("v", [])
+            if len(ids) == 1 and _YOUTUBE_ID.fullmatch(ids[0]):
+                return ids[0]
+            raise ValueError(_INVALID_YOUTUBE_ID)
+        match = re.fullmatch(r"/(?:shorts|live|embed)/([A-Za-z0-9_-]{11})/?", parsed.path)
+    elif host in ("youtube-nocookie.com", "www.youtube-nocookie.com"):
+        match = re.fullmatch(r"/embed/([A-Za-z0-9_-]{11})/?", parsed.path)
+    else:
+        raise ValueError(_INVALID_YOUTUBE_ID)
+    if match is None:
+        raise ValueError(_INVALID_YOUTUBE_ID)
+    return match.group(1)
+
+
+def _normalize_video_id(provider: str, identifier: str) -> str:
+    if provider == "bilibili":
+        return normalize_bvid(identifier)
+    if provider == "youtube":
+        return normalize_youtube_id(identifier)
+    raise ValueError("不支持的视频来源")
+
+
+def video_url(provider: str, identifier: str) -> str:
+    """Return the canonical watch URL, or an empty string for a custom album."""
+    if provider == "bilibili" and identifier == "":
+        return ""
+    identifier = _normalize_video_id(provider, identifier)
+    if provider == "youtube":
+        return f"https://www.youtube.com/watch?v={identifier}"
+    return f"https://www.bilibili.com/video/{identifier}/"
+
+
 def _integer(value: object, minimum: int, label: str) -> None:
     if type(value) is not int or value < minimum:
         raise ValueError(f"{label}必须是大于等于 {minimum} 的整数")
@@ -59,6 +119,11 @@ class Track:
     id: str = field(default_factory=lambda: str(uuid4()))
     date: str = ""
     song_id: str = ""
+    provider: str = "bilibili"
+
+    @property
+    def video_url(self) -> str:
+        return video_url(self.provider, self.bvid)
 
     def __post_init__(self) -> None:
         _text(self.title, "标题")
@@ -66,9 +131,14 @@ class Track:
         _text(self.song_id, "歌曲 ID")
         _text(self.artist, "作者")
         _text(self.date, "日期")
-        self.bvid = normalize_bvid(self.bvid)
-        _integer(self.cid, 1, "CID")
+        self.bvid = _normalize_video_id(self.provider, self.bvid)
+        _integer(self.cid, 0 if self.provider == "youtube" else 1, "CID")
         _integer(self.page, 1, "分 P 序号")
+        if self.provider == "youtube":
+            if self.cid != 0:
+                raise ValueError("YouTube 视频的 CID 必须为 0")
+            if self.page != 1:
+                raise ValueError("YouTube 视频的分 P 序号必须为 1")
         _integer(self.duration, 0, "时长")
 
 
@@ -84,6 +154,11 @@ class LibraryEntry:
     resolved: bool = False
     artist: str = ""
     date: str = ""
+    provider: str = "bilibili"
+
+    @property
+    def video_url(self) -> str:
+        return video_url(self.provider, self.bvid)
 
     def __post_init__(self) -> None:
         _text(self.title, "标题")
@@ -92,9 +167,13 @@ class LibraryEntry:
         _text(self.date, "日期")
         if self.kind not in ("single", "album"):
             raise ValueError("条目类型必须是 single 或 album")
-        if self.kind != "album" or self.bvid != "":
-            self.bvid = normalize_bvid(self.bvid)
+        if self.provider == "youtube" and self.kind != "single":
+            raise ValueError("YouTube 仅支持单曲。")
+        if (self.provider, self.kind, self.bvid) != ("bilibili", "album", ""):
+            self.bvid = _normalize_video_id(self.provider, self.bvid)
         _integer(self.page, 1, "分 P 序号")
+        if self.provider == "youtube" and self.page != 1:
+            raise ValueError("YouTube 视频的分 P 序号必须为 1")
         _text(self.cover, "封面")
         if type(self.resolved) is not bool:
             raise ValueError("专辑解析状态必须是布尔值")
@@ -127,6 +206,16 @@ class Store:
             raise ValueError("不支持的迷你播放器样式")
         if "audio_output_id" in result:
             _text(result["audio_output_id"], "音频输出设备 ID")
+        if "youtube_use_chrome" in result and type(result["youtube_use_chrome"]) is not bool:
+            raise ValueError("YouTube 登录设置必须是布尔值")
+        if "proxy_mode" in result or "proxy_url" in result:
+            from .network import validate_proxy_url
+
+            mode = result.get("proxy_mode", "system")
+            if mode not in ("system", "direct", "manual"):
+                raise ValueError("不支持的代理模式")
+            result["proxy_mode"] = mode
+            result["proxy_url"] = validate_proxy_url(result.get("proxy_url", "")) if mode == "manual" else ""
         if "play_mode" in result:
             value = result["play_mode"]
             if type(value) is not int or not 0 <= value <= 3:
@@ -175,14 +264,16 @@ class Store:
         """Fill missing legacy queue references without changing explicit IDs."""
         from .catalog import find_song
 
-        songs = {(entry.bvid, entry.page): entry.id for entry in entries if entry.kind == "single"}
+        songs = {(entry.provider, entry.bvid, entry.page): entry.id
+                 for entry in entries if entry.kind == "single"}
         for track in tracks:
             if track.song_id:
                 continue
             song = find_song(entries, track.id)
-            identifier = song.id if song is not None else songs.get((track.bvid, track.page))
-            if identifier is not None:
-                track.song_id = identifier
+            if song is not None and song.provider == track.provider:
+                track.song_id = song.id
+            else:
+                track.song_id = songs.get((track.provider, track.bvid, track.page), "")
 
     def load(self) -> tuple[list[LibraryEntry], list[Track], int]:
         entries, tracks, volume, settings, _, _ = self._read()
