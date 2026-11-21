@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import QApplication
 from bili_player.app import MainWindow, STYLE, copy_tracks
 from bili_player.details import EntryDetailsDialog
 from bili_player.dialogs import AlbumDialog
-from bili_player.exchange import read_library
+from bili_player.exchange import read_library_package
 from bili_player.models import LibraryEntry, normalize_bvid
 
 
@@ -104,14 +104,14 @@ def main() -> int:
                     sample_single = window.song_for_track(first, imported)
                     if sample_single is None:
                         raise RuntimeError("Imported album has no canonical song entity")
-                export_path = args.preview_pair / "library-export-example.json"
+                export_path = args.preview_pair / "library-export-example.zip"
                 export_path.parent.mkdir(parents=True, exist_ok=True)
-                if not window.export_json_path(export_path):
+                if not window.export_selection_path(export_path, [imported.id]):
                     raise RuntimeError("Library export failed")
-                exported = read_library(export_path)
-                if len(exported) != len(window.entries):
-                    raise RuntimeError("Export did not include the entire library")
-                print(f"Entire-library JSON export/read OK: {len(exported)} entries")
+                exported = read_library_package(export_path, window.covers)
+                if imported.id not in {entry.id for entry in exported}:
+                    raise RuntimeError("Export did not include the selected entry")
+                print(f"Selected library ZIP export/read OK: {len(exported)} entries")
                 window.search.setFocus()
                 window.set_theme("light")
                 window.set_language("zh_CN")

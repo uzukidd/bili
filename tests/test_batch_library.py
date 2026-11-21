@@ -107,8 +107,8 @@ class BatchLibraryTests(unittest.TestCase):
                 self.assertEqual(self.window._selected_entry_ids, {entry.id})
                 self.assertTrue(self.window.batch_copy_button.isEnabled())
                 self.assertTrue(self.window.batch_delete_button.isEnabled())
-                self.assertFalse(self.window.batch_export_button.isEnabled())
-                self.assertEqual(self.window.batch_export_button.toolTip(), "暂未实现")
+                self.assertTrue(self.window.batch_export_button.isVisible())
+                self.assertTrue(self.window.batch_export_button.isEnabled())
                 with patch.object(self.window, "copy_library_entries") as copy, \
                      patch.object(self.window, "delete_library_entries") as delete:
                     self.window.batch_copy_button.click()

@@ -31,7 +31,7 @@ from .covers import CoverCache
 from .details import EntryDetailsDialog
 from .dialog_dimming import install_dialog_dimming
 from .dialogs import AlbumDialog, EntryDialog
-from .exchange import read_library, write_library
+from .exchange import read_library_package, write_library_package
 from .i18n import translate, translate_error
 from .list_dialog import ListImportDialog
 from .lyrics import LyricsStore
@@ -347,6 +347,8 @@ class MainWindow(QMainWindow):
         title_row.addWidget(self._text("我的音乐库", "heading"))
         title_row.addStretch()
         title_row.addWidget(self._button("＋ 新建专辑", self.new_album))
+        self.import_library_button = self._button("导入音乐库", self.import_library)
+        title_row.addWidget(self.import_library_button)
         title_row.addWidget(self._button("导入列表", self.import_list))
         title_row.addWidget(self._button("＋ 导入视频", self.add_entry, True))
         lib_layout.addLayout(title_row)
@@ -361,9 +363,6 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._render_library)
         filter_row.addWidget(self.tabs)
         filter_row.addStretch()
-        self.json_button = button("JSON", self.show_json_menu)
-        self._bind(self.json_button, "导入或导出全部曲目", "setToolTip")
-        filter_row.addWidget(self.json_button)
         self.search = QLineEdit()
         self._bind(self.search, "搜索名称 / BV", "setPlaceholderText")
         self.search.setClearButtonEnabled(True)
@@ -382,9 +381,8 @@ class MainWindow(QMainWindow):
             [entry.id for entry in self._selected_library_entries()]))
         self.batch_delete_button = self._button("删除", lambda: self.delete_library_entries(
             [entry.id for entry in self._selected_library_entries()]))
-        self.batch_export_button = self._button("批量导出", lambda: None)
+        self.batch_export_button = self._button("批量导出", self.export_selection)
         self.batch_export_button.setEnabled(False)
-        self._bind(self.batch_export_button, "暂未实现", "setToolTip")
         for widget in (self.exit_selection_button, self.select_all_button, self.batch_copy_button,
                        self.batch_delete_button, self.batch_export_button):
             batch_tools.addWidget(widget)
@@ -394,6 +392,7 @@ class MainWindow(QMainWindow):
         self.selection_tools.hide()
         lib_layout.addWidget(self.selection_tools)
         scroll = QScrollArea()
+        self.library_scroll = scroll
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.cards = LibraryGrid()
@@ -927,7 +926,18 @@ class MainWindow(QMainWindow):
     def _card_drag_state(self, active: bool):
         self._library_drag_active = active
         if not active and self._library_render_pending and not self._closing:
-            QTimer.singleShot(0, self._render_library)
+            QTimer.singleShot(0, self._refresh_library_after_drag)
+
+    def _refresh_library_after_drag(self):
+        if self._closing or self._library_drag_active or not self._library_render_pending:
+            return
+        bar = self.library_scroll.verticalScrollBar()
+        position = bar.value()
+        focus = QApplication.focusWidget()
+        if focus is not None and self.cards.isAncestorOf(focus):
+            self.library_scroll.setFocus()
+        self._render_library()
+        bar.setValue(position)
 
     def _render_library(self, *_):
         if not hasattr(self, "grid") or self._closing:
@@ -939,10 +949,14 @@ class MainWindow(QMainWindow):
         self.cards.clear()
         query = self.search.text().strip().lower()
         kind = {1: "album", 2: "single"}.get(self.tabs.currentIndex())
-        album_song_ids = {track.song_id or track.id for entry in self.entries if entry.kind == "album"
-                          for track in entry.tracks}
+        album_titles = {}
+        albums = sorted((entry for entry in self.entries if entry.kind == "album"),
+                        key=lambda entry: (entry.title.casefold(), entry.id))
+        for album in albums:
+            for track in album.tracks:
+                album_titles.setdefault(track.song_id or track.id, album.title)
         entries = [e for e in self.entries if (not kind or e.kind == kind)
-                   and (kind is not None or e.kind == "album" or e.id not in album_song_ids)
+                   and (kind is not None or e.kind == "album" or e.id not in album_titles)
                    and (query in e.title.lower() or query in e.bvid.lower())]
         self._visible_entry_ids = [e.id for e in entries]
         self._selected_entry_ids.intersection_update(self._visible_entry_ids)
@@ -976,10 +990,12 @@ class MainWindow(QMainWindow):
             art.setToolTip(self.tr("打开专辑" if entry.kind == "album" else "打开单曲详情"))
             if entry.kind == "album":
                 subtitle = self.tr("专辑 · {count} 首", count=len(entry.tracks)) if entry.resolved else self.tr("专辑 · 等待导入")
-            elif entry.provider == "youtube":
-                subtitle = "YouTube"
             else:
-                subtitle = entry.tracks[0].artist if entry.tracks and entry.tracks[0].artist else self.tr("单曲 · P{page}", page=entry.page)
+                artist = entry.artist.strip()
+                if not artist and entry.tracks:
+                    artist = entry.tracks[0].artist.strip()
+                album_title = album_titles.get(entry.id, "").strip()
+                subtitle = " · ".join(filter(None, (album_title, artist))) or self.tr("单曲")
             card.set_content(art, entry.title, subtitle, self.tr("播放"))
             card.set_selection(self._selection_mode, entry.id in self._selected_entry_ids)
             card.selection_box.setAccessibleName(self.tr("选择 {title}", title=entry.title))
@@ -1010,7 +1026,7 @@ class MainWindow(QMainWindow):
             identity not in self._selected_entry_ids for identity in self._visible_entry_ids
         ))
         self.selection_count.setText(self.tr("已选择 {count} 项", count=len(self._selected_entry_ids)))
-        for widget in (self.batch_copy_button, self.batch_delete_button):
+        for widget in (self.batch_copy_button, self.batch_delete_button, self.batch_export_button):
             widget.setEnabled(bool(self._selected_entry_ids))
         for card in self.cards._cards:
             card.set_selection(self._selection_mode, card.entry_id in self._selected_entry_ids)
@@ -1145,7 +1161,14 @@ class MainWindow(QMainWindow):
             return
         source, target = indexes[source_id], indexes[target_id]
         self.entries[source], self.entries[target] = self.entries[target], self.entries[source]
-        self._render_library()
+        visible = set(self._visible_entry_ids)
+        ordered_ids = [entry.id for entry in self.entries if entry.id in visible]
+        if len(ordered_ids) == len(visible):
+            self.cards.reorder_cards(ordered_ids)
+            self._visible_entry_ids = ordered_ids
+        else:
+            self._library_render_pending = True
+            self._refresh_library_after_drag()
         self._save()
 
     def _load_cover(self, source: str, artwork):
@@ -1309,47 +1332,48 @@ class MainWindow(QMainWindow):
             self._error(self.tr("清除音频缓存失败：{message}", message=message))
         self._submit(self.proxy.clear_cache, done, failed)
 
-    def show_json_menu(self):
-        menu = QMenu(self)
-        menu.addAction(self.tr("导入 JSON 曲目…"), self.import_json)
-        menu.addAction(self.tr("导出全部曲目 JSON…"), self.export_json)
-        menu.exec(self.json_button.mapToGlobal(self.json_button.rect().bottomLeft()))
-        menu.deleteLater()
+    def export_selection(self):
+        entries = self._selected_library_entries()
+        if not self._selection_mode or not entries:
+            return
+        dialog = QFileDialog(self, self.tr("批量导出"), "bili-music-library.zip", self.tr("音乐库 ZIP 包 (*.zip)"))
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setDefaultSuffix("zip")
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.export_selection_path(Path(dialog.selectedFiles()[0]), [entry.id for entry in entries])
+        dialog.deleteLater()
 
-    def export_json(self):
-        filename, _ = QFileDialog.getSaveFileName(
-            self, self.tr("导出全部曲目"), "bili-music-library.json", self.tr("JSON 文件 (*.json)"),
-        )
-        if filename:
-            self.export_json_path(Path(filename))
-
-    def export_json_path(self, path: Path):
-        if path.resolve() == self.store.path.resolve():
-            self._error(self.tr("请选择其他路径，不能覆盖播放器正在使用的音乐库。"))
+    def export_selection_path(self, path: Path, identities: list[str]):
+        selected = set(identities)
+        identities = [entry.id for entry in self.entries if entry.id in selected]
+        if not identities:
             return False
         try:
-            write_library(path, self.entries)
+            if path.resolve() == self.store.path.resolve():
+                self._error(self.tr("请选择其他路径，不能覆盖播放器正在使用的音乐库。"))
+                return False
+            write_library_package(path, self.entries, identities)
         except (ValueError, OSError) as exc:
-            self._error(self.tr("导出失败：{message}", message=str(exc)))
+            self._error(self.tr("导出失败：{message}", message=translate_error(str(exc), self.language)))
             return False
-        self._status("已导出全部 {count} 项音乐库内容", count=len(self.entries))
+        self._status("已导出所选 {count} 项", count=len(identities))
         return True
 
-    def import_json(self):
+    def import_library(self):
         filename, _ = QFileDialog.getOpenFileName(
-            self, self.tr("导入 JSON 曲目"), "", self.tr("JSON 文件 (*.json)"),
+            self, self.tr("导入音乐库"), "", self.tr("音乐库 ZIP 包 (*.zip)"),
         )
         if filename:
-            self.import_json_path(Path(filename))
+            self.import_library_path(Path(filename))
 
-    def import_json_path(self, path: Path):
+    def import_library_path(self, path: Path):
         try:
-            entries = read_library(path)
+            entries = read_library_package(path, self.covers)
         except (ValueError, OSError) as exc:
-            self._error(self.tr("导入失败：{message}", message=str(exc)))
+            self._error(self.tr("导入失败：{message}", message=translate_error(str(exc), self.language)))
             return False
         if not entries:
-            self._status("JSON 中没有可导入的曲目")
+            self._status("音乐库包中没有可导入的曲目")
             return True
         original = self.entries
         from copy import deepcopy
@@ -1360,7 +1384,7 @@ class MainWindow(QMainWindow):
             self.entries = original
             return False
         self._render_library()
-        self._status("已从 JSON 导入 {count} 项，已有曲目保留", count=len(entries))
+        self._status("已导入 {count} 项，已有曲目保留", count=len(entries))
         return True
 
     def import_list(self):

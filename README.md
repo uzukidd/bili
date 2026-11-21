@@ -33,7 +33,8 @@ bash scripts/deploy.sh
 
 - Search lyrics from LRCLIB
 
-- Import/Export as JSON
+- **Export selected** appears in the multi-select toolbar. The ZIP includes the selected entries, songs referenced by selected albums, and their local covers. Use **Import library** beside **New album** to import the ZIP.
+  进入多选后，在工具栏点击 **批量导出**。ZIP 包包含所选条目、所选专辑引用的歌曲及其本地封面。点击 **新建专辑** 旁的 **导入音乐库** 即可导入 ZIP。
 
 - Mini music player
 

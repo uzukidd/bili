@@ -1,21 +1,23 @@
-"""Integration of full-library JSON exchange, absolute seek, and mini overlay."""
+"""Integration of library packages, absolute seek, and mini overlay."""
 from __future__ import annotations
 
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import json
+import zipfile
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtGui import QImage
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QDialog
 
 from bili_player.app import MainWindow
-from bili_player.exchange import read_library, write_library
+from bili_player.exchange import read_library_package, write_library_package
 from bili_player.models import LibraryEntry, Track, Store
 
 BV = "BV1GJ411x7h7"
@@ -48,39 +50,54 @@ class PlayerIntegrationTests(unittest.TestCase):
             LibraryEntry("Album", kind="album", tracks=[Track("Song A", BV, 1, 1, artist="Author", date="2025 Spring")],
                          cover="https://example.test/cover.jpg", resolved=True),
             LibraryEntry("Single", BV, page=2, tracks=[Track("Song B", BV, 2, 2)],
-                         cover="C:/external/cover.png", resolved=True, date="Manual date"),
+                         resolved=True, date="Manual date"),
         ]
 
-    def test_export_always_includes_entire_library_not_filtered_view_or_queue(self):
+    def test_export_selected_album_includes_its_songs_and_restores_local_covers(self):
         original = self.entries()
         self.window.entries = original
         self.window._append_tracks([Track("Queue only", BV, 3, 3)])
-        self.window.tabs.setCurrentIndex(2)
-        self.window.search.setText("Single")
-        destination = self.root / "export.json"
-        self.assertTrue(self.window.export_json_path(destination))
-        imported = read_library(destination)
-        self.assertEqual([e.title for e in imported], ["Album", "Single", "Song A"])
-        self.assertIs(imported[0].tracks[0], imported[2].tracks[0])
-        self.assertEqual(imported[0].tracks[0].song_id, imported[2].id)
-        self.assertEqual(imported[0].tracks[0].date, "2025 Spring")
-        self.assertEqual(imported[1].date, "Manual date")
-        self.assertEqual(imported[0].cover, original[0].cover)
-        self.assertEqual(imported[1].cover, "")
-        self.assertEqual(original[1].cover, "C:/external/cover.png")
-        payload = json.loads(destination.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 3)
-        self.assertEqual([e["id"] for e in payload["entries"]], [e.id for e in original])
-        self.assertEqual(payload["entries"][0]["song_ids"], [original[2].id])
+        album, single, member = original
+        picture = self.root / "original-art.png"
+        image = QImage(24, 24, QImage.Format.Format_RGB32)
+        image.fill(0xFF1A2B3C)
+        self.assertTrue(image.save(str(picture)))
+        album.cover = member.cover = str(picture)
+        destination = self.root / "export.zip"
+        self.window._render_library()
+        self.window.enter_library_selection(album.id)
+        with patch("bili_player.app.QFileDialog") as dialog:
+            dialog.return_value.exec.return_value = QDialog.DialogCode.Accepted
+            dialog.return_value.selectedFiles.return_value = [str(destination)]
+            self.window.batch_export_button.click()
+        self.window._error.assert_not_called()
+        with zipfile.ZipFile(destination) as archive:
+            payload = json.loads(archive.read("library.json"))
+            names = archive.namelist()
+            self.assertEqual(len(names), 2)
+            self.assertEqual(archive.read(payload["entries"][0]["cover"]), picture.read_bytes())
+        self.assertEqual([entry["id"] for entry in payload["entries"]], [album.id, member.id])
+        self.assertEqual(payload["entries"][0]["song_ids"], [member.id])
+        self.assertNotIn("settings", payload)
         self.assertNotIn("tracks", payload["entries"][0])
-        self.assertEqual([e.id for e in imported], [e.id for e in original])
-        self.assertNotIn("Queue only", destination.read_text(encoding="utf-8"))
-        self.assertNotIn("settings", destination.read_text(encoding="utf-8"))
+        self.assertEqual(album.cover, str(picture))
+
+        imported = read_library_package(destination, self.window.covers)
+        self.assertEqual([entry.title for entry in imported], ["Album", "Song A"])
+        self.assertIs(imported[0].tracks[0], imported[1].tracks[0])
+        self.assertEqual(imported[0].tracks[0].date, "2025 Spring")
+        cover = Path(imported[0].cover)
+        self.assertEqual(cover.parent, self.window.covers.directory.resolve())
+        self.assertEqual(cover.read_bytes(), picture.read_bytes())
+        self.assertEqual(imported[1].cover, imported[0].cover)
+
+    def write_package(self, destination, entries):
+        write_library_package(destination, entries, [entry.id for entry in entries])
 
     def test_import_appends_all_entries_without_playback_and_persists_ids(self):
         incoming = self.entries()
-        destination = self.root / "incoming.json"
-        write_library(destination, incoming)
+        destination = self.root / "incoming.zip"
+        self.write_package(destination, incoming)
         existing = LibraryEntry("Keep me", kind="album", resolved=True)
         self.window.entries = [existing]
         queued = Track("Playing", BV, 99, 1)
@@ -88,7 +105,7 @@ class PlayerIntegrationTests(unittest.TestCase):
         self.window.current_id = queued.id
         request = self.window._request
         with patch.object(self.window.player, "stop") as stop, patch.object(self.window.player, "setSource") as source:
-            self.assertTrue(self.window.import_json_path(destination))
+            self.assertTrue(self.window.import_library_path(destination))
             stop.assert_not_called()
             source.assert_not_called()
         self.assertEqual([e.title for e in self.window.entries], ["Keep me", "Album", "Single", "Song A"])
@@ -114,12 +131,12 @@ class PlayerIntegrationTests(unittest.TestCase):
         occurrence = self.window._tracks()[0]
         self.window.current_id = occurrence.id
         request = self.window._request
-        destination = self.root / "incoming.json"
+        destination = self.root / "incoming.zip"
         incoming = self.entries()
         incoming[0].tracks[0].song_id = existing.id
-        write_library(destination, incoming)
+        self.write_package(destination, incoming)
         with patch.object(self.window.player, "stop") as stop, patch.object(self.window.player, "setSource") as source:
-            self.assertTrue(self.window.import_json_path(destination))
+            self.assertTrue(self.window.import_library_path(destination))
             stop.assert_not_called()
             source.assert_not_called()
         self.assertEqual([entry.title for entry in self.window.entries],
@@ -142,15 +159,15 @@ class PlayerIntegrationTests(unittest.TestCase):
         existing = LibraryEntry("Keep original", BV, tracks=[Track("Keep original", BV, 1, 1)], resolved=True)
         self.window.entries = [existing]
         self.window._normalize_library()
-        destination = self.root / "incoming.json"
-        write_library(destination, self.entries())
-        self.assertTrue(self.window.import_json_path(destination))
+        destination = self.root / "incoming.zip"
+        self.write_package(destination, self.entries())
+        self.assertTrue(self.window.import_library_path(destination))
         self.assertEqual([entry.title for entry in self.window.entries],
                          ["Keep original", "Album", "Single", "Song A"])
         self.assertIs(self.window.entries[1].tracks[0], self.window.entries[3].tracks[0])
         self.assertIsNot(self.window.entries[1].tracks[0], self.window.entries[0].tracks[0])
         identifiers = [entry.id for entry in self.window.entries]
-        self.assertTrue(self.window.import_json_path(destination))
+        self.assertTrue(self.window.import_library_path(destination))
         self.assertEqual([entry.id for entry in self.window.entries], identifiers)
 
     def test_invalid_import_and_failed_save_do_not_change_library(self):
@@ -160,12 +177,12 @@ class PlayerIntegrationTests(unittest.TestCase):
         original = self.window.store.path.read_bytes()
         path = self.root / "bad.json"
         path.write_text('{"format":"bili-music-library","version":1,"entries":[{}]}', encoding="utf-8")
-        self.assertFalse(self.window.import_json_path(path))
+        self.assertFalse(self.window.import_library_path(path))
         self.assertIs(self.window.entries, existing)
         self.assertEqual(self.window.store.path.read_bytes(), original)
-        write_library(path, self.entries())
+        self.write_package(path, self.entries())
         with patch.object(self.window.store, "save", side_effect=OSError("disk full")):
-            self.assertFalse(self.window.import_json_path(path))
+            self.assertFalse(self.window.import_library_path(path))
         self.assertIs(self.window.entries, existing)
         self.assertEqual(self.window.store.path.read_bytes(), original)
 
@@ -173,18 +190,26 @@ class PlayerIntegrationTests(unittest.TestCase):
         self.window.entries = self.entries()
         self.window._save()
         original = self.window.store.path.read_bytes()
-        self.assertFalse(self.window.export_json_path(self.window.store.path))
+        self.assertFalse(self.window.export_selection_path(self.window.store.path, [self.window.entries[0].id]))
         self.assertEqual(self.window.store.path.read_bytes(), original)
         self.window._error.assert_called_once()
 
     def test_file_dialog_cancel_does_not_import_or_export(self):
-        with patch("bili_player.app.QFileDialog.getSaveFileName", return_value=("", "")), \
-             patch("bili_player.app.write_library") as writer:
-            self.window.export_json()
+        self.window.entries = self.entries()
+        self.window._render_library()
+        with patch("bili_player.app.QFileDialog") as dialog, \
+             patch("bili_player.app.write_library_package") as writer:
+            self.window.export_selection()
+            dialog.assert_not_called()
+            self.window.enter_library_selection(self.window.entries[0].id)
+            dialog.return_value.exec.return_value = QDialog.DialogCode.Rejected
+            self.window.batch_export_button.click()
+            dialog.return_value.exec.assert_called_once_with()
             writer.assert_not_called()
-        with patch("bili_player.app.QFileDialog.getOpenFileName", return_value=("", "")), \
-             patch("bili_player.app.read_library") as reader:
-            self.window.import_json()
+        with patch("bili_player.app.QFileDialog.getOpenFileName", return_value=("", "")) as chooser, \
+             patch("bili_player.app.read_library_package") as reader:
+            self.window.import_library_button.click()
+            chooser.assert_called_once()
             reader.assert_not_called()
 
     def test_full_and_mini_click_seek_once_and_keep_paused_state(self):
