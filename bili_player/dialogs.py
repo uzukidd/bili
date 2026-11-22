@@ -34,6 +34,8 @@ def _source_fields(provider: str) -> tuple[str, str, str]:
 
 
 def _format_source(item: LibraryEntry | Track) -> str:
+    if item.provider == "local":
+        return ""
     if item.provider == "youtube":
         return f"YouTube · {item.bvid}"
     return f"{item.bvid} · P{item.page}"
@@ -109,6 +111,8 @@ class EntryDialog(_Dialog):
         self.source_input.addItem(self.tr("哔哩哔哩"), "bilibili")
         if not bilibili_only or (entry is not None and entry.provider == "youtube"):
             self.source_input.addItem("YouTube", "youtube")
+        if entry is not None and entry.provider == "local":
+            self.source_input.addItem(self.tr("本地音频"), "local")
         if entry is not None:
             self.source_input.setCurrentIndex(self.source_input.findData(entry.provider))
             self.source_input.setEnabled(False)
@@ -159,9 +163,10 @@ class EntryDialog(_Dialog):
             self.kind_input.setCurrentIndex(self.kind_input.findData("single"))
             self.page_input.setValue(1)
         self.kind_input.setEnabled(not youtube and (self.entry is None or self.entry.kind != "single"))
-        self.form.setRowVisible(self.kind_input, not youtube)
-        self.form.setRowVisible(self.page_input, not youtube)
-        self.album_hint.setVisible(not youtube)
+        self.form.setRowVisible(self.kind_input, provider == "bilibili")
+        self.form.setRowVisible(self.page_input, provider == "bilibili")
+        self.form.setRowVisible(self.bvid_input, provider != "local")
+        self.album_hint.setVisible(provider == "bilibili")
         label, placeholder, _ = _source_fields(provider)
         self.bvid_label.setText(self.tr(label))
         self.bvid_input.setPlaceholderText(self.tr(placeholder))
@@ -178,9 +183,9 @@ class EntryDialog(_Dialog):
         provider = self.entry.provider if self.entry is not None else self.source_input.currentData()
         youtube = provider == "youtube"
         normalize = normalize_youtube_id if youtube else normalize_bvid
-        bvid = normalize(self.bvid_input.text())
+        bvid = self.entry.bvid if provider == "local" else normalize(self.bvid_input.text())
         changes = {
-            "title": self.title_input.text().strip() or bvid,
+            "title": self.title_input.text().strip() or (self.entry.title if provider == "local" else bvid),
             "bvid": bvid,
             "provider": provider,
             "kind": "single" if youtube else self.kind_input.currentData(),
@@ -240,15 +245,17 @@ class TrackDialog(_Dialog):
         form.addRow(self.tr("曲目名称"), self.title_input)
         form.addRow(self.tr("作者"), self.artist_input)
         form.addRow(self.tr("日期"), self.date_input)
-        form.addRow(self.tr(label), self.bvid_input)
-        if not youtube:
+        if track.provider != "local":
+            form.addRow(self.tr(label), self.bvid_input)
+        if track.provider == "bilibili":
             form.addRow(self.tr("分 P"), self.page_input)
         layout.addLayout(form)
         hint = self._label(self.tr(
             "更改视频 ID 后会重新读取音频信息。" if youtube else "更改 BV 或分 P 后会重新读取音频信息。",
         ), "muted")
         hint.setWordWrap(True)
-        layout.addWidget(hint)
+        if track.provider != "local":
+            layout.addWidget(hint)
         self.error = self._label()
         self.error.setObjectName("dialogError")
         self.error.setWordWrap(True)
@@ -259,6 +266,9 @@ class TrackDialog(_Dialog):
         title = self.title_input.text().strip()
         if not title:
             raise ValueError(self.tr("请输入曲目名称。"))
+        if self.track.provider == "local":
+            return replace(self.track, title=title, artist=self.artist_input.text().strip(),
+                           date=self.date_input.text().strip())
         youtube = self.track.provider == "youtube"
         normalize = normalize_youtube_id if youtube else normalize_bvid
         return replace(

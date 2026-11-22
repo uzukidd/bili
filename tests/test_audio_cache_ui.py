@@ -101,6 +101,51 @@ class AudioCacheUITests(unittest.TestCase):
             self.window.player.setPosition(700)
             self.assertEqual(self.window.player.position(), 700)
 
+    def test_youtube_download_saves_complete_cache_without_replacing_the_playback_stream(self):
+        identifier = "Dvl7IEqtcz4"
+        track = Track("Song", identifier, 0, 1, provider="youtube")
+        song = LibraryEntry(track.title, identifier, tracks=[track], resolved=True, provider="youtube")
+        self.window.entries.append(song)
+        self.window._normalize_library()
+        key, source = self.window._audio_cache_identity(track)
+        fixture = AudioFixture()
+        try:
+            url = self.window.proxy.set_stream(fixture.url, cache_key=key, source_key=source)
+            self.assertEqual(requests.get(url, timeout=3).content, fixture.data)
+        finally:
+            fixture.close()
+        self.window._submit = lambda fn, done, error=None: done(fn())
+        with patch.object(self.window, "_source_client") as client:
+            self.window.download_audio(song)
+        client.assert_not_called()
+        self.assertEqual(self.window.local_audio_path(track).read_bytes(), fixture.data)
+        self.assertEqual(requests.get(url, timeout=3).content, fixture.data)
+
+    def test_youtube_download_reports_cdn_403_without_saving_audio(self):
+        identifier = "Dvl7IEqtcz4"
+        track = Track("Song", identifier, 0, 1, provider="youtube")
+        song = LibraryEntry(track.title, identifier, tracks=[track], resolved=True, provider="youtube")
+        self.window.entries.append(song)
+        self.window._normalize_library()
+        pending = []
+        self.window._submit = lambda fn, done, error=None: pending.append((fn, done, error))
+        client = Mock()
+        client.get_stream.return_value = "https://cdn.example.test/audio.m4a"
+        response = requests.Response()
+        response.status_code = 403
+        response._content = b""
+        response._content_consumed = True
+        with patch.object(self.window, "_source_client", return_value=client), \
+                patch("bili_player.audio_files.network.get", return_value=response):
+            self.window.download_audio(song)
+            load, _, failed = pending[0]
+            with self.assertRaisesRegex(ValueError, "HTTP 403") as raised:
+                load()
+            failed(str(raised.exception))
+        self.assertIn("HTTP 403", self.window._error.call_args.args[0])
+        self.assertFalse(track.audio_file)
+        self.assertFalse(self.window.audio_download_pending(song))
+
     def test_stream_registration_uses_entity_id_and_stale_callback_is_ignored(self):
         song = self.song()
         self.window._append_tracks(copy_tracks(song.tracks))

@@ -489,6 +489,30 @@ class StreamProxy:
             finally:
                 self._cache.release(entry)
 
+    def save_cached_audio(self, cache_key: str, source_key: str, save) -> str | None:
+        if not self._cache or self._closed.is_set():
+            return None
+        entry = self._cache.acquire_complete(cache_key, source_key)
+        if entry is None:
+            return None
+        try:
+            with entry.download_lock:
+                size, revision = entry.size, entry.revision
+
+                def chunks():
+                    for index in range((size + BLOCK_SIZE - 1) // BLOCK_SIZE):
+                        data = self._cache.read_block(entry, index)
+                        if data is None or entry.revision != revision:
+                            raise UpstreamError("Incomplete cached audio")
+                        yield data
+
+                try:
+                    return save(entry.content_type, chunks(), size=size)
+                except UpstreamError:
+                    return None
+        finally:
+            self._cache.release(entry)
+
     def release_stream(self) -> None:
         with self._lock:
             streams, self._streams = self._streams, {}

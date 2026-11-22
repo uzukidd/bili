@@ -19,6 +19,13 @@ _YOUTUBE_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
 _INVALID_YOUTUBE_ID = "请输入有效的 YouTube 视频 ID 或链接"
 _DEFAULT_SETTINGS = {"theme": "light", "language": "zh_CN"}
+_LOCAL_ID = re.compile(r"[0-9a-f]{32}")
+AUDIO_EXTENSIONS = ("mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "webm", "aif", "aiff", "wma", "mka")
+_AUDIO_FILE = re.compile(r"[0-9a-f]{64}\.(?:" + "|".join(AUDIO_EXTENSIONS) + ")")
+
+
+def valid_audio_file(name: str) -> bool:
+    return isinstance(name, str) and _AUDIO_FILE.fullmatch(name) is not None
 
 
 def normalize_bvid(text: str) -> str:
@@ -85,12 +92,14 @@ def _normalize_video_id(provider: str, identifier: str) -> str:
         return normalize_bvid(identifier)
     if provider == "youtube":
         return normalize_youtube_id(identifier)
+    if provider == "local" and isinstance(identifier, str) and _LOCAL_ID.fullmatch(identifier):
+        return identifier
     raise ValueError("不支持的视频来源")
 
 
 def video_url(provider: str, identifier: str) -> str:
     """Return the canonical watch URL, or an empty string for a custom album."""
-    if provider == "bilibili" and identifier == "":
+    if provider == "local" or (provider == "bilibili" and identifier == ""):
         return ""
     identifier = _normalize_video_id(provider, identifier)
     if provider == "youtube":
@@ -120,6 +129,7 @@ class Track:
     date: str = ""
     song_id: str = ""
     provider: str = "bilibili"
+    audio_file: str = ""
 
     @property
     def video_url(self) -> str:
@@ -131,9 +141,13 @@ class Track:
         _text(self.song_id, "歌曲 ID")
         _text(self.artist, "作者")
         _text(self.date, "日期")
+        if self.audio_file != "" and not valid_audio_file(self.audio_file):
+            raise ValueError("本地音频文件引用无效")
         self.bvid = _normalize_video_id(self.provider, self.bvid)
-        _integer(self.cid, 0 if self.provider == "youtube" else 1, "CID")
+        _integer(self.cid, 0 if self.provider in ("youtube", "local") else 1, "CID")
         _integer(self.page, 1, "分 P 序号")
+        if self.provider == "local" and (self.cid != 0 or self.page != 1 or not self.audio_file):
+            raise ValueError("本地单曲必须引用一个本地音频文件")
         if self.provider == "youtube":
             if self.cid != 0:
                 raise ValueError("YouTube 视频的 CID 必须为 0")
@@ -172,6 +186,8 @@ class LibraryEntry:
         if (self.provider, self.kind, self.bvid) != ("bilibili", "album", ""):
             self.bvid = _normalize_video_id(self.provider, self.bvid)
         _integer(self.page, 1, "分 P 序号")
+        if self.provider == "local" and (self.kind != "single" or self.page != 1):
+            raise ValueError("本地来源仅支持单曲")
         if self.provider == "youtube" and self.page != 1:
             raise ValueError("YouTube 视频的分 P 序号必须为 1")
         _text(self.cover, "封面")

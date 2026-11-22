@@ -256,11 +256,20 @@ def merge_libraries(
     if incoming is existing:
         return existing
     normalize_library(incoming)
-    known_ids = {entry.id for entry in existing}
+    known = {entry.id: entry for entry in existing}
     for entry in incoming:
-        if entry.id not in known_ids:
+        current = known.get(entry.id)
+        if current is None:
             existing.append(entry)
-            known_ids.add(entry.id)
+            known[entry.id] = entry
+        elif current.kind == entry.kind and _source(current) == _source(entry):
+            if not current.cover and entry.cover:
+                current.cover = entry.cover
+            if current.kind == "single" and entry.tracks and entry.tracks[0].audio_file:
+                if not current.tracks:
+                    current.tracks = entry.tracks
+                elif current.tracks[0].cid == entry.tracks[0].cid and not current.tracks[0].audio_file:
+                    current.tracks[0].audio_file = entry.tracks[0].audio_file
     return normalize_library(existing)
 
 

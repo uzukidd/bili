@@ -224,6 +224,14 @@ class AudioCache:
             return False
         return True
 
+    def acquire_complete(self, key: str, source: str) -> CacheEntry | None:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry.pending or entry.source != source or not self._complete_on_disk(entry):
+                return None
+            self.acquire(entry)
+            return entry
+
     def acquire(self, entry):
         with self._lock:
             entry.readers += 1

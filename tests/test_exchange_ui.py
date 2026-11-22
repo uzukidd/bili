@@ -4,7 +4,10 @@ from __future__ import annotations
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import hashlib
 import json
+import time
+import wave
 import zipfile
 import tempfile
 import unittest
@@ -17,6 +20,7 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDialog
 
 from bili_player.app import MainWindow
+from bili_player.details import EntryDetailsDialog
 from bili_player.exchange import read_library_package, write_library_package
 from bili_player.models import LibraryEntry, Track, Store
 
@@ -36,6 +40,11 @@ class PlayerIntegrationTests(unittest.TestCase):
         self.window._load_cover = Mock()
         self.window._error = Mock()
         self.window.show()
+        cached_image = QImage(16, 16, QImage.Format.Format_RGB32)
+        cached_image.fill(0xFF335577)
+        self.window.covers.directory.mkdir()
+        key = hashlib.sha256(b"https://example.test/cover.jpg").hexdigest()
+        self.assertTrue(cached_image.save(str(self.window.covers.directory / (key + ".img")), "PNG"))
         self.app.processEvents()
 
     def tearDown(self):
@@ -44,6 +53,19 @@ class PlayerIntegrationTests(unittest.TestCase):
         self.window.deleteLater()
         self.app.processEvents()
         self.directory.cleanup()
+
+    def wait_for_tasks(self):
+        deadline = time.monotonic() + 5
+        while self.window._tasks and time.monotonic() < deadline:
+            QTest.qWait(10)
+        self.assertFalse(self.window._tasks)
+
+    def wav(self, name="song.wav", sample=b"\x01\x00"):
+        path = self.root / name
+        with wave.open(str(path), "wb") as audio:
+            audio.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
+            audio.writeframes(sample * 8000)
+        return path
 
     def entries(self):
         return [
@@ -70,6 +92,7 @@ class PlayerIntegrationTests(unittest.TestCase):
             dialog.return_value.exec.return_value = QDialog.DialogCode.Accepted
             dialog.return_value.selectedFiles.return_value = [str(destination)]
             self.window.batch_export_button.click()
+        self.wait_for_tasks()
         self.window._error.assert_not_called()
         with zipfile.ZipFile(destination) as archive:
             payload = json.loads(archive.read("library.json"))
@@ -211,6 +234,156 @@ class PlayerIntegrationTests(unittest.TestCase):
             self.window.import_library_button.click()
             chooser.assert_called_once()
             reader.assert_not_called()
+
+    def test_local_import_keeps_copy_and_plays_directly(self):
+        original = self.wav()
+        with patch("bili_player.app.QFileDialog.getOpenFileNames", return_value=([str(original)], "")):
+            self.window.import_audio_button.click()
+        self.wait_for_tasks()
+        original.unlink()
+        song = self.window.entries[0]
+        detail = EntryDetailsDialog(self.window, song)
+        self.addCleanup(detail.deleteLater)
+        deadline = time.monotonic() + 5
+        while song.tracks[0].duration == 0 and time.monotonic() < deadline:
+            QTest.qWait(10)
+        self.assertEqual(song.tracks[0].duration, 1)
+        self.assertEqual(detail.meta_label.text(), "单曲 · 0:01")
+        self.assertTrue(self.window.player.source().isEmpty())
+        self.assertTrue(self.window._save())
+        songs, _, _ = Store(self.window.store.path).load()
+        self.assertEqual([(song.title, song.tracks[0].duration) for song in songs], [("song", 1)])
+        self.assertEqual(detail.local_audio_label.text(), "已在本地 · 可离线播放")
+        self.assertTrue(detail.download_button.isHidden())
+        path = self.window.local_audio_path(song.tracks[0])
+        with patch.object(self.window, "_source_client") as client, \
+                patch.object(self.window.proxy, "get_cached_stream") as cache:
+            self.window.resolve_entry(song, True)
+            self.assertEqual(Path(self.window.player.source().toLocalFile()), path)
+            deadline = time.monotonic() + 3
+            while self.window.player.duration() == 0 and time.monotonic() < deadline:
+                QTest.qWait(10)
+            self.assertEqual(self.window.player.duration(), 1000)
+            client.assert_not_called()
+            cache.assert_not_called()
+        self.window._error.assert_not_called()
+
+    def test_existing_local_song_duration_is_backfilled_on_startup(self):
+        source = "1" * 32
+        track = Track("Legacy song", source, 0, 1, provider="local",
+                      audio_file=self.window.audio_files.import_file(self.wav()))
+        song = LibraryEntry(track.title, source, provider="local", tracks=[track], resolved=True)
+        album = LibraryEntry("Album", kind="album", tracks=[track], resolved=True)
+        queued = Track(track.title, source, 0, 1, provider="local", song_id=song.id, audio_file=track.audio_file)
+        store = Store(self.root / "legacy.json")
+        store.save([album, song], [queued], 70)
+        restored = MainWindow(store.path)
+        try:
+            album, song = restored.entries
+            detail = EntryDetailsDialog(restored, album)
+            self.assertTrue(detail.meta_label.text().endswith("—"))
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if store.load()[0][1].tracks[0].duration:
+                    break
+                QTest.qWait(10)
+            entries, queue, _ = store.load()
+            self.assertEqual(entries[1].tracks[0].duration, 1)
+            self.assertEqual(queue[0].duration, 1)
+            self.assertEqual(album.tracks[0].duration, 1)
+            self.assertTrue(detail.meta_label.text().endswith("0:01"))
+            self.assertTrue(restored.player.source().isEmpty())
+        finally:
+            restored._quitting = True
+            restored.close()
+            restored.deleteLater()
+
+    def test_download_updates_details_and_existing_queue_without_resolving_again(self):
+        track = Track("Remote", BV, 10, 1)
+        song = LibraryEntry("Remote", BV, tracks=[track], resolved=True)
+        self.window.entries = [song]
+        self.window.resolve_entry(song, False)
+        audio_data = self.wav().read_bytes()
+        client = Mock()
+        client.get_stream.return_value = "https://example.test/audio.wav"
+        response = Mock(status_code=200, headers={"Content-Type": "audio/wav", "Content-Length": str(len(audio_data))})
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.iter_content.return_value = iter([audio_data[:2048], audio_data[2048:]])
+        detail = EntryDetailsDialog(self.window, song)
+        self.addCleanup(detail.deleteLater)
+        self.assertEqual(detail.local_audio_label.text(), "未下载到本地")
+        with patch.object(self.window, "_source_client", return_value=client) as resolver, \
+                patch("bili_player.audio_files.network.get", return_value=response) as request:
+            detail.download_button.click()
+            self.assertEqual(detail.local_audio_label.text(), "正在下载音频…")
+            self.wait_for_tasks()
+            resolver.assert_called_once()
+            client.get_stream.assert_called_once()
+            request.assert_called_once()
+            self.assertEqual(detail.local_audio_label.text(), "已在本地 · 可离线播放")
+            self.window.proxy.clear_cache()
+            self.window.play_item(self.window.queue.item(0))
+            self.assertTrue(self.window.player.source().isLocalFile())
+            resolver.assert_called_once()
+            request.assert_called_once()
+        restored = Store(self.window.store.path).load()[0][0]
+        self.assertEqual(self.window.audio_files.path(restored.tracks[0].audio_file).read_bytes(), audio_data)
+        self.window._error.assert_not_called()
+
+    def test_zip_checkbox_controls_downloads_and_embeds_both_kinds_of_cover(self):
+        files = self.window.audio_files
+        original = self.wav("local.wav")
+        local_file = files.import_file(original)
+        remote_file = files.import_file(self.wav("download.wav", b"\x04\x00"))
+        source = "1" * 32
+        local = LibraryEntry("Local", source, provider="local", resolved=True,
+                             tracks=[Track("Local", source, 0, 1, provider="local", audio_file=local_file)])
+        remote = LibraryEntry("Remote", BV, resolved=True, cover="https://example.test/uncached.png",
+                              tracks=[Track("Remote", BV, 1, 1, audio_file=remote_file)])
+        picture = QImage(16, 16, QImage.Format.Format_RGB32)
+        picture.fill(0xFF996622)
+        path = self.root / "local-cover.png"
+        self.assertTrue(picture.save(str(path)))
+        local.cover = str(path)
+        cached = self.window.covers.directory / (hashlib.sha256(b"https://example.test/cover.jpg").hexdigest() + ".img")
+        data = cached.read_bytes()
+        response = Mock(status_code=200)
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.iter_content.side_effect = lambda _: iter([data])
+        album = LibraryEntry("Album", kind="album", tracks=[local.tracks[0], remote.tracks[0]], resolved=True)
+        local.tracks[0].song_id, remote.tracks[0].song_id = local.id, remote.id
+        self.window.entries = [album, local, remote]
+        self.window._render_library()
+        self.window.enter_library_selection(album.id)
+        for checked in (False, True):
+            destination = self.root / f"package-{checked}.zip"
+            with patch("bili_player.app.QFileDialog") as dialog, \
+                    patch("bili_player.covers.requests.get", return_value=response) as request:
+                dialog.return_value.exec.return_value = QDialog.DialogCode.Accepted
+                dialog.return_value.selectedFiles.return_value = [str(destination)]
+                dialog.return_value.layout.return_value.addWidget.side_effect = lambda checkbox, *_: checkbox.setChecked(checked)
+                self.window.export_selection()
+                self.wait_for_tasks()
+                self.assertEqual(request.call_count, int(not checked))
+            with zipfile.ZipFile(destination) as archive:
+                self.assertEqual(len([name for name in archive.namelist() if name.startswith("covers/")]), 2)
+                self.assertEqual({name for name in archive.namelist() if name.startswith("audio/")},
+                                 {f"audio/{local_file}", f"audio/{remote_file}"} if checked else {f"audio/{local_file}"})
+            from bili_player.audio_files import AudioFiles
+            from bili_player.covers import CoverCache
+            restored_files = AudioFiles(self.root / f"restored-{checked}" / "audio-files")
+            restored = read_library_package(destination, CoverCache(restored_files.directory.parent / "covers"), restored_files)
+            restored_album, restored_local, restored_remote = restored
+            self.assertIs(restored_album.tracks[0], restored_local.tracks[0])
+            self.assertIs(restored_album.tracks[1], restored_remote.tracks[0])
+            self.assertEqual(Path(restored_local.cover).read_bytes(), path.read_bytes())
+            self.assertEqual(Path(restored_remote.cover).read_bytes(), data)
+            self.assertEqual(restored_files.path(local_file).read_bytes(), original.read_bytes())
+            self.assertEqual(restored_remote.tracks[0].audio_file, remote_file if checked else "")
+            self.assertEqual(restored_files.path(remote_file) is not None, checked)
+        self.window._error.assert_not_called()
 
     def test_full_and_mini_click_seek_once_and_keep_paused_state(self):
         self.window._duration(200000)
