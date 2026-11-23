@@ -66,11 +66,21 @@ QListWidget { background: PANEL; border: none; border-radius: 8px; outline: none
 QListWidget::item { padding: 10px 6px; margin: 2px 0; border-radius: 7px; }
 QListWidget::item:selected { background: SOFT; color: TEXT; }
 QListWidget::item:hover { background: SOFT; }
+QFrame#floatingLyrics { background: PANEL; border: 1px solid LINE; border-radius: 12px; }
+QLabel#floatingLyricsCaption { color: MUTED; }
+QLabel#floatingLyricsLine { font-size: 24px; font-weight: 700; }
+QTextEdit#floatingLyricsPlain { background: transparent; border: none; font-size: 16px; }
+QToolButton#floatingLyricsClose { border: none; border-radius: 6px; font-size: 20px; }
+QToolButton#floatingLyricsClose:hover, QPushButton#floatingLyricsToggle:checked { background: SOFT; }
+QPushButton#floatingLyricsToggle:checked { color: TEXT; border-color: ACCENT; }
 QListWidget#miniLyrics { border: 1px solid LINE; border-radius: 9px; }
 QListWidget#miniLyrics::item { font-size: 15px; color: MUTED; padding: 8px 12px; }
 QListWidget#miniLyrics::item:hover { background: transparent; }
 QListWidget#miniLyrics::item:selected { background: SOFT; color: TEXT; font-weight: 700; }
 QListWidget::indicator { width: 16px; height: 16px; }
+QProgressBar#audioDownloadProgress { background: BG; color: TEXT; border: 1px solid LINE;
+    border-radius: 5px; text-align: center; }
+QProgressBar#audioDownloadProgress::chunk { background: ACCENT; border-radius: 4px; }
 QSlider::groove:horizontal { height: 4px; background: LINE; border-radius: 2px; }
 QSlider::sub-page:horizontal { background: ACCENT; border-radius: 2px; }
 QSlider::handle:horizontal { width: 12px; margin: -4px 0; background: ACCENT; border-radius: 6px; }

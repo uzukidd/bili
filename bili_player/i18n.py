@@ -35,6 +35,7 @@ ENGLISH = {
     "歌词预览加载失败": "Could not load preview", "纯音乐": "Instrumental",
     "LRCLIB 请求过于频繁，请在 {seconds} 秒后重试。": "LRCLIB is rate limiting requests. Try again in {seconds} seconds.",
     "保存歌词": "Save lyrics", "显示歌词": "Show lyrics", "返回封面": "Return to cover",
+    "歌词悬浮窗": "Floating lyrics", "关闭歌词悬浮窗": "Close floating lyrics",
     "无法保存歌词": "Could not save lyrics",
     "网络代理": "Network proxy", "代理地址": "Proxy address",
     "系统代理": "System proxy", "直连": "Direct", "手动代理": "Manual proxy",
@@ -263,6 +264,7 @@ ENGLISH = {
     "部分音频文件导入失败：{message}": "Some audio files could not be imported: {message}",
     "下载到本地": "Download audio",
     "正在下载音频…": "Downloading audio…",
+    "音频下载进度": "Audio download progress",
     "正在下载 {title}…": "Downloading {title}…",
     "已下载 {title}，可以离线播放": "Downloaded {title} for offline playback",
     "已在本地 · 可离线播放": "Available offline",
@@ -279,7 +281,15 @@ ENGLISH = {
     "不支持的音频文件格式": "Unsupported audio format",
     "音频文件必须非空且不超过 1 GiB": "Audio files must be nonempty and at most 1 GiB",
     "音频文件为空或不完整": "Audio file is empty or incomplete",
+    "选择保存位置…": "Choose save location…",
     "包含已下载的音频": "Include downloaded audio",
+    "包含歌词": "Include saved lyrics",
+    "导出歌词需要歌词存储": "A lyrics store is required to export lyrics",
+    "无法读取已保存的歌词": "Could not read saved lyrics",
+    "歌词文件过大，最大支持 16 MiB": "The lyrics file exceeds 16 MiB",
+    "音乐库包的歌词数据无效": "The library package contains invalid lyrics data",
+    "请选择其他路径，不能覆盖播放器正在使用的歌词库。": "Choose another location to avoid overwriting the active lyrics library.",
+    "曲目已导入，歌词保存失败：{message}": "Tracks were imported, but lyrics could not be saved ({message}).",
     "本地导入的音频和所有封面始终包含在 ZIP 中。": "ZIP always includes imported local audio and all covers.",
     "无法打包封面，请检查网络或封面文件": "Could not package the cover. Check your connection or the image file.",
     "音乐库包的音频引用无效": "Invalid audio reference in the library package",
@@ -347,6 +357,7 @@ def translate_error(message: str, language: str) -> str:
         "视频暂不可见": "Video unavailable", "视频仅作者可见": "Private video",
         "请求参数错误": "Invalid request parameters", "视频分 P 数据不完整：": "Incomplete part metadata: ",
     }
+    message = re.sub(r"音频请求失败（HTTP (\d+)）", r"Audio request failed (HTTP \1)", message)
     for source, replacement in replacements.items():
         message = message.replace(source, replacement)
     message = re.sub(r"导入 (BV[0-9A-Za-z]{10}) 失败，未保存专辑：", r"Could not import \1; no album was saved: ", message)

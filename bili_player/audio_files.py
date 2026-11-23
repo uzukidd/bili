@@ -8,13 +8,8 @@ from itertools import chain
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from requests import RequestException
-from requests.structures import CaseInsensitiveDict
-
-from . import network
-from .api import HEADERS
 from .models import AUDIO_EXTENSIONS, valid_audio_file
-from .stream import _audio_bytes, _content_type
+from .stream import _audio_bytes
 
 MAX_AUDIO_BYTES = 1024 ** 3
 CHUNK_SIZE = 256 * 1024
@@ -49,24 +44,7 @@ class AudioFiles:
             return self.store(iter(lambda: handle.read(CHUNK_SIZE), b""), extension,
                               size=os.fstat(handle.fileno()).st_size)
 
-    def download(self, url: str) -> str:
-        headers = CaseInsensitiveDict(getattr(url, "http_headers", HEADERS))
-        headers.pop("Range", None)
-        headers["Accept-Encoding"] = "identity"
-        try:
-            with network.get(url, headers=headers, timeout=(8, 25), stream=True) as response:
-                if response.status_code == 403:
-                    raise ValueError("音频服务器拒绝下载请求（HTTP 403）")
-                response.raise_for_status()
-                if response.status_code != 200 or response.headers.get("Content-Range"):
-                    raise ValueError("服务器未返回完整音频")
-                length = response.headers.get("Content-Length")
-                return self.store_stream(_content_type(response), response.iter_content(CHUNK_SIZE),
-                                         size=int(length) if length else None, url=url)
-        except RequestException:
-            raise ValueError("下载音频时网络请求失败") from None
-
-    def store_stream(self, content_type: str, chunks, *, size: int | None, url: str = "") -> str:
+    def store_stream(self, content_type: str, chunks, *, size: int | None, url: str = "", progress=None) -> str:
         mime = content_type.split(";", 1)[0].strip().lower()
         extension = _AUDIO_TYPES.get(mime) or Path(urlsplit(url).path).suffix.lower().lstrip(".")
         chunks = (chunk for chunk in chunks if chunk)
@@ -79,9 +57,10 @@ class AudioFiles:
             else:
                 raise ValueError("不支持的音频文件格式")
             chunks = chain((first,), chunks)
-        return self.store(chunks, extension, size=size)
+        return self.store(chunks, extension, size=size, progress=progress)
 
-    def store(self, chunks, extension: str, *, size: int | None = None, expected: str | None = None) -> str:
+    def store(self, chunks, extension: str, *, size: int | None = None, expected: str | None = None,
+              progress=None) -> str:
         if extension not in AUDIO_EXTENSIONS:
             raise ValueError("不支持的音频文件格式")
         if size is not None and not 0 < size <= MAX_AUDIO_BYTES:
@@ -89,6 +68,8 @@ class AudioFiles:
         self.directory.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256()
         written = 0
+        if progress is not None:
+            progress(written, size)
         temporary = None
         try:
             with tempfile.NamedTemporaryFile(dir=self.directory, suffix=".tmp", delete=False) as output:
@@ -103,6 +84,8 @@ class AudioFiles:
                         raise ValueError("音频文件必须非空且不超过 1 GiB")
                     digest.update(chunk)
                     output.write(chunk)
+                    if progress is not None:
+                        progress(written, size)
             if not written or (size is not None and written != size):
                 raise ValueError("音频文件为空或不完整")
             name = f"{digest.hexdigest()}.{extension}"

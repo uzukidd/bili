@@ -8,13 +8,14 @@ from PyQt6.QtCore import QEvent, QItemSelectionModel, QPointF, QRectF, QSignalBl
 from PyQt6.QtGui import QKeySequence, QMouseEvent, QPainter, QPainterPath, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
-    QLabel, QListWidget, QListWidgetItem, QMenu, QPushButton, QScrollArea, QSizePolicy,
+    QLabel, QListWidget, QListWidgetItem, QMenu, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
     QVBoxLayout, QWidget, QStyledItemDelegate,
 )
 
 from .i18n import translate
 from .models import LibraryEntry, Track
 from .window_chrome import FramelessController, TitleBar
+from .window_dialogs import exec_for_window
 
 
 def _duration(seconds: int) -> str:
@@ -198,6 +199,13 @@ class EntryDetailsDialog(QDialog):
         information.addWidget(self.source_label)
         self.local_audio_label = self._label(name="muted")
         information.addWidget(self.local_audio_label)
+        self.download_progress = QProgressBar()
+        self.download_progress.setObjectName("audioDownloadProgress")
+        self.download_progress.setAccessibleName(self.tr("音频下载进度"))
+        self.download_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.download_progress.setFixedHeight(18)
+        self.download_progress.hide()
+        information.addWidget(self.download_progress)
         information.addStretch()
         self.information_opacity = QGraphicsOpacityEffect(self.information_widget)
         self.information_widget.setGraphicsEffect(self.information_opacity)
@@ -291,6 +299,9 @@ class EntryDetailsDialog(QDialog):
         changed = getattr(self._owner, "libraryChanged", None)
         if changed is not None:
             changed.connect(self.refresh)
+        progress_changed = getattr(self._owner, "audioDownloadProgressChanged", None)
+        if is_single and progress_changed is not None:
+            progress_changed.connect(self._refresh_download_progress)
 
     def tr(self, text: str, **values) -> str:
         return translate(text, language=self.language, **values)
@@ -395,7 +406,7 @@ class EntryDetailsDialog(QDialog):
         title = entry.title or (entry.tracks[0].title if entry.tracks else "")
         dialog = LyricsSearchDialog(self, title, submit=submit, language=self.language)
         try:
-            if dialog.exec() != QDialog.DialogCode.Accepted or sip.isdeleted(dialog):
+            if exec_for_window(dialog) != QDialog.DialogCode.Accepted or sip.isdeleted(dialog):
                 return
             selected = dialog.selected_lyrics
         finally:
@@ -472,6 +483,20 @@ class EntryDetailsDialog(QDialog):
         self.entry = current
         return current
 
+    def _refresh_download_progress(self, song_id=None):
+        if song_id is not None and song_id != self.entry.id:
+            return
+        lookup = getattr_static(self._owner, "audio_download_progress", None)
+        progress = self._owner.audio_download_progress(self.entry) if self.entry.kind == "single" and callable(lookup) else None
+        if progress is None:
+            self.download_progress.hide()
+            return
+        self.download_progress.setRange(0, 0 if progress < 0 else 100)
+        self.download_progress.setTextVisible(progress >= 0)
+        if progress >= 0:
+            self.download_progress.setValue(progress)
+        self.download_progress.show()
+
     def refresh(self):
         entry = self._current_entry()
         if entry is None:
@@ -520,6 +545,7 @@ class EntryDetailsDialog(QDialog):
         self.download_button.setVisible(bool(track and entry.provider != "local" and not local
                                              and callable(getattr_static(self._owner, "download_audio", None))))
         self.download_button.setEnabled(not pending)
+        self._refresh_download_progress()
         self.source_label.setText(self.tr("来源：{bvid}", bvid=source) if source else "")
         self.source_label.setVisible(bool(source))
         self.tracks_list.clear()

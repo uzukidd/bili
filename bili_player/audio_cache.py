@@ -11,12 +11,36 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 BLOCK_SIZE = 256 * 1024
 
 
 def fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _representation_key(source: str, url: str) -> str:
+    # YouTube's signed CDN URL changes, but these fields identify its media revision.
+    if source.startswith("youtube:"):
+        parsed = urlsplit(url)
+        host = parsed.hostname or ""
+        if parsed.scheme == "https" and host.endswith(".googlevideo.com") and parsed.path == "/videoplayback":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            values = [query.get(name, []) for name in ("id", "itag", "lmt", "clen")]
+            if ("range" not in query and all(len(value) == 1 and value[0] for value in values)
+                    and all(value[0].isascii() and value[0].isdigit() for value in values[1:])):
+                return fingerprint(json.dumps([source, *(value[0] for value in values)]))
+    return fingerprint(url)
+
+
+def _resource_key(url):
+    parts = urlsplit(url)
+    return fingerprint(urlunsplit((parts.scheme, parts.netloc, parts.path, "", "")))
+
+
+def strong_etag(value: str) -> bool:
+    return len(value) >= 2 and value.startswith('"') and value.endswith('"')
 
 
 @dataclass(eq=False)
@@ -28,6 +52,7 @@ class CacheEntry:
     content_type: str = "application/octet-stream"
     etag: str = ""
     url_hash: str = ""
+    resource_hash: str = ""
     chunks: dict[int, dict] = field(default_factory=dict)
     accessed: float = field(default_factory=time.time)
     active: bool = False
@@ -115,6 +140,7 @@ class AudioCache:
                 entry = CacheEntry(key, source, path.parent, size=size,
                                    content_type=str(data.get("content_type", "application/octet-stream")),
                                    etag=str(data.get("etag", "")), url_hash=str(data.get("url_hash", "")),
+                                   resource_hash=str(data.get("resource_hash", "")),
                                    accessed=float(data.get("accessed", 0)),
                                    pending=bool(data.get("pending", False)) or (path.parent / "pending").exists())
                 for number, chunk in data.get("chunks", {}).items():
@@ -163,7 +189,7 @@ class AudioCache:
             entry.directory.mkdir(parents=True, exist_ok=True)
             data = {"version": 1, "block_size": BLOCK_SIZE, "key": entry.key,
                     "source": entry.source, "size": entry.size, "etag": entry.etag,
-                    "content_type": entry.content_type, "url_hash": entry.url_hash,
+                    "content_type": entry.content_type, "url_hash": entry.url_hash, "resource_hash": entry.resource_hash,
                     "accessed": entry.accessed, "pending": entry.pending,
                     "chunks": entry.chunks}
             with temporary.open("w", encoding="utf-8") as handle:
@@ -178,7 +204,21 @@ class AudioCache:
             except OSError:
                 pass
 
-    def activate(self, key: str, source: str, url: str = "", *, complete_only=False) -> CacheEntry | None:
+    def cached_validator(self, key, source, url):
+        with self._lock:
+            entry = self._entries.get(key)
+            if (entry and not entry.pending and entry.source == source and entry.chunks
+                    and entry.resource_hash == _resource_key(url)
+                    and not self._matches_url(entry, url) and strong_etag(entry.etag)):
+                return entry, entry.size, entry.etag
+        return None
+
+    @staticmethod
+    def _matches_url(entry, url):
+        return entry.url_hash in (fingerprint(url), _representation_key(entry.source, url))
+
+    def activate(self, key: str, source: str, url: str = "", *, complete_only=False,
+                 download=False, confirmed=None) -> CacheEntry | None:
         with self._lock:
             entry = self._entries.get(key)
             if entry and entry.source != source:
@@ -186,26 +226,25 @@ class AudioCache:
                 entry = None
             if entry and entry.pending:
                 entry = None
-            if complete_only:
-                if not entry or not self._complete_on_disk(entry):
-                    return None
-            elif entry is None:
-                entry = CacheEntry(key, source, self.directory / (fingerprint(key) + "." + uuid.uuid4().hex))
-                entry.writable = self._enabled
-                self._entries[key] = entry
-            if entry is None:
+            if complete_only and (not entry or not self._complete_on_disk(entry)):
                 return None
-            if url and not entry.complete and entry.url_hash and entry.url_hash != fingerprint(url):
-                # A refreshed signed URL may refer to a different representation. A full
-                # source-key hit is reusable, but partial data needs a confirmed validator.
-                # Conservatively start a new generation rather than mix representations.
+            if (entry and url and entry.url_hash and (download or not entry.complete)
+                    and not self._matches_url(entry, url)
+                    and confirmed != (entry, entry.size, entry.etag)):
+                # A fresh URL can only reuse old bytes for the same representation.
                 self._retire(entry)
+                entry = None
+            if entry is None:
                 entry = CacheEntry(key, source, self.directory / (fingerprint(key) + "." + uuid.uuid4().hex))
                 entry.writable = self._enabled
                 self._entries[key] = entry
             if url:
-                entry.url_hash = fingerprint(url)
-            entry.active = True
+                entry.url_hash = _representation_key(source, url)
+                entry.resource_hash = _resource_key(url)
+            if download:
+                self.acquire(entry)
+            else:
+                entry.active = True
             entry.accessed = time.time()
             self._save(entry)
             return entry

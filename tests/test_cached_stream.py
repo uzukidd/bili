@@ -14,6 +14,7 @@ from unittest.mock import patch
 import requests
 
 from bili_player.audio_cache import BLOCK_SIZE
+from bili_player.audio_files import AudioFiles
 from bili_player.stream import StreamProxy
 
 
@@ -112,6 +113,62 @@ class CachedStreamTests(unittest.TestCase):
         self.url = self.proxy.set_stream(self.fixture.url, cache_key='song1', source_key='bili:1')
         with patch('bili_player.stream.requests.request', side_effect=AssertionError('Cached range must not hit network')):
             self.assertEqual(self.get('bytes=50-199').content, self.fixture.data[50:200])
+
+    def save_audio(self, resolve, *, allow_cached=False, key='song1', source='bili:1'):
+        files = AudioFiles(Path(self.temp.name) / 'offline')
+        name = self.proxy.download_audio(key, source, resolve, files.store_stream, allow_cached=allow_cached)
+        return files.path(name).read_bytes()
+
+    def test_download_requests_only_missing_blocks_without_replacing_playback(self):
+        self.get('bytes=0-99')
+        self.get(f'bytes={2*BLOCK_SIZE}-{2*BLOCK_SIZE+99}')
+        self.fixture.seen.clear()
+
+        def resolve():
+            self.fail('Should reuse the current playback URL')
+
+        self.assertEqual(self.save_audio(resolve, allow_cached=True), self.fixture.data)
+        self.assertEqual(self.fixture.seen, [
+            ('GET', f'bytes={BLOCK_SIZE}-{2*BLOCK_SIZE-1}'),
+            ('GET', f'bytes={3*BLOCK_SIZE}-{len(self.fixture.data)-1}'),
+        ])
+        self.assertEqual(self.get().content, self.fixture.data)
+        self.assertEqual(len(self.fixture.seen), 2)
+
+    def test_download_reuses_persisted_blocks_if_refreshed_url_validates(self):
+        self.get('bytes=0-99')
+        self.proxy.close()
+        self.proxy = StreamProxy(Path(self.temp.name))
+        self.fixture.seen.clear()
+        self.assertEqual(self.save_audio(lambda: self.fixture.url + '?signature=new'), self.fixture.data)
+        self.assertEqual(self.fixture.seen[0], ('HEAD', None))
+        self.assertNotIn(('GET', f'bytes=0-{BLOCK_SIZE-1}'), self.fixture.seen)
+        self.assertEqual(len(self.fixture.seen), 4)
+
+    def test_resuming_download_cannot_mix_old_and_changed_content(self):
+        self.get('bytes=0-99')
+        self.fixture.data = b'x' * len(self.fixture.data)
+        self.fixture.etag = '"version2"'
+        self.assertEqual(self.save_audio(lambda: self.fixture.url, allow_cached=True), self.fixture.data)
+
+    def test_ignored_range_with_existing_cache_restarts_from_byte_zero(self):
+        self.get('bytes=0-99')
+        self.fixture.data = b'x' * len(self.fixture.data)
+        self.fixture.ignore_range = True
+        self.fixture.get_etag = False
+        self.assertEqual(self.save_audio(lambda: self.fixture.url, allow_cached=True), self.fixture.data)
+
+    def test_failed_download_keeps_valid_existing_blocks_and_no_offline_file(self):
+        self.get('bytes=0-99')
+        self.fixture.truncate = True
+        with self.assertRaisesRegex(ValueError, '下载音频'):
+            self.save_audio(lambda: self.fixture.url, allow_cached=True)
+        self.assertEqual(list((Path(self.temp.name) / 'offline').iterdir()), [])
+        self.assertEqual(self.proxy.cache_info()['bytes'], BLOCK_SIZE)
+        self.fixture.truncate = False
+        self.fixture.seen.clear()
+        self.assertEqual(self.save_audio(lambda: self.fixture.url, allow_cached=True), self.fixture.data)
+        self.assertEqual(self.fixture.seen[0], ('GET', f'bytes={BLOCK_SIZE}-{2*BLOCK_SIZE-1}'))
 
     def test_complete_cache_range_head_suffix_and_416_without_upstream(self):
         self.assertEqual(self.get().content, self.fixture.data)

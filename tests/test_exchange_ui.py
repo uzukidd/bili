@@ -10,9 +10,12 @@ import time
 import wave
 import zipfile
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+import requests
 
 from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtGui import QImage
@@ -20,9 +23,12 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDialog
 
 from bili_player.app import MainWindow
+from bili_player.audio_cache import BLOCK_SIZE
 from bili_player.details import EntryDetailsDialog
 from bili_player.exchange import read_library_package, write_library_package
+from bili_player.lyrics import LyricsEntry, LyricsStore, SongLyrics
 from bili_player.models import LibraryEntry, Track, Store
+from tests.test_cached_stream import RangeFixture
 
 BV = "BV1GJ411x7h7"
 
@@ -88,10 +94,13 @@ class PlayerIntegrationTests(unittest.TestCase):
         destination = self.root / "export.zip"
         self.window._render_library()
         self.window.enter_library_selection(album.id)
-        with patch("bili_player.app.QFileDialog") as dialog:
+        with patch("bili_player.app.ExportOptionsDialog.exec", return_value=QDialog.DialogCode.Accepted), \
+                patch("bili_player.app.QFileDialog") as dialog:
             dialog.return_value.exec.return_value = QDialog.DialogCode.Accepted
             dialog.return_value.selectedFiles.return_value = [str(destination)]
             self.window.batch_export_button.click()
+            dialog.return_value.setOption.assert_not_called()
+            dialog.return_value.setDefaultSuffix.assert_called_once_with("zip")
         self.wait_for_tasks()
         self.window._error.assert_not_called()
         with zipfile.ZipFile(destination) as archive:
@@ -144,6 +153,77 @@ class PlayerIntegrationTests(unittest.TestCase):
         restored = Store(self.window.store.path).load()[0]
         self.assertEqual([e.title for e in restored], ["Keep me", "Album", "Single", "Song A"])
         self.assertIs(restored[1].tracks[0], restored[3].tracks[0])
+
+    def test_import_restores_active_lyrics_and_merges_versions_by_song_id(self):
+        incoming = self.entries()
+        album, fresh_song = incoming
+        track = album.tracks[0]
+        song = LibraryEntry(track.title, BV, tracks=[Track(track.title, BV, 1, 1)], resolved=True)
+        track.song_id = song.id
+        inactive = LibraryEntry("Inactive", BV, page=3, tracks=[Track("Inactive", BV, 3, 3)])
+        incoming.append(inactive)
+        self.window.entries = [song, inactive]
+        current = LyricsEntry("local:1", "Edited", plain_lyrics="My version")
+        conflict = LyricsEntry("local:1", "Imported", plain_lyrics="Their version")
+        synced = LyricsEntry("lrclib:2", "Synced", synced_lyrics="[00:01]第一行", source="lrclib")
+        inactive_current = LyricsEntry("local:3", "Unselected", plain_lyrics="No active version")
+        self.window.lyrics_store.save(song.id, current)
+        self.window.lyrics_store.save(inactive.id, inactive_current, select=False)
+        source = LyricsStore(self.root / "source" / "lyrics.json")
+        source.save(song.id, conflict)
+        source.save(song.id, synced, select=False)
+        source.save(fresh_song.id, conflict)
+        source.save(fresh_song.id, synced)
+        source.save(inactive.id, synced)
+        destination = self.root / "with-lyrics.zip"
+        write_library_package(destination, incoming, [entry.id for entry in incoming],
+                              covers=self.window.covers, lyrics_store=source, include_lyrics=True)
+
+        self.assertTrue(self.window.import_library_path(destination))
+        restored = LyricsStore(self.window.lyrics_store.path)
+        self.assertEqual(restored.load(fresh_song.id), SongLyrics((conflict, synced), synced.id))
+        self.assertEqual(restored.load(inactive.id), SongLyrics((inactive_current, synced)))
+        merged = restored.load(song.id)
+        self.assertEqual(merged.active, current)
+        self.assertEqual(len(merged.entries), 3)
+        self.assertEqual(merged.entries[0], current)
+        self.assertEqual(merged.entries[1].plain_lyrics, conflict.plain_lyrics)
+        self.assertNotEqual(merged.entries[1].id, conflict.id)
+        self.assertEqual(merged.entries[2], synced)
+        self.assertTrue(self.window.import_library_path(destination))
+        self.assertEqual(restored.load(song.id), merged)
+        self.window._error.assert_not_called()
+
+    def test_invalid_lyrics_package_is_rejected_before_persistence(self):
+        incoming = self.entries()
+        album, song = incoming
+        self.window.entries = incoming
+        self.assertTrue(self.window._save())
+        local = LyricsEntry("local:1", "Original", plain_lyrics="Preserve this")
+        self.window.lyrics_store.save(song.id, local)
+        library_before = self.window.store.path.read_bytes()
+        lyrics_before = self.window.lyrics_store.path.read_bytes()
+        original = self.root / "original.zip"
+        self.write_package(original, incoming)
+        with zipfile.ZipFile(original) as archive:
+            members = {name: archive.read(name) for name in archive.namelist()}
+        destination = self.root / "invalid.zip"
+        rows = [{"id": "local:1", "title": "Imported"}]
+        for malformed in (
+            {"version": 2, "songs": {}},
+            {"version": 1, "songs": {album.id: {"entries": rows}}},
+            {"version": 1, "songs": {"unknown-song": {"entries": rows}}},
+            {"version": 1, "songs": {song.id: {"entries": rows, "active_id": "missing"}}},
+            {"version": 1, "songs": {song.id: {"entries": rows * 2}}},
+        ):
+            with self.subTest(malformed=malformed):
+                with zipfile.ZipFile(destination, "w") as archive:
+                    for name, data in members.items():
+                        archive.writestr(name, data)
+                    archive.writestr("lyrics.json", json.dumps(malformed))
+                self.assertFalse(self.window.import_library_path(destination))
+                self.assertEqual(self.window.store.path.read_bytes(), library_before)
+                self.assertEqual(self.window.lyrics_store.path.read_bytes(), lyrics_before)
 
     def test_import_merges_existing_song_authority_and_keeps_new_folder_reference(self):
         existing = LibraryEntry("Keep canonical metadata", BV, tracks=[Track("Keep canonical metadata", BV, 9, 1)],
@@ -203,33 +283,47 @@ class PlayerIntegrationTests(unittest.TestCase):
         self.assertFalse(self.window.import_library_path(path))
         self.assertIs(self.window.entries, existing)
         self.assertEqual(self.window.store.path.read_bytes(), original)
-        self.write_package(path, self.entries())
+        incoming = self.entries()
+        source = LyricsStore(self.root / "source" / "lyrics.json")
+        source.save(incoming[1].id, LyricsEntry("local:1", "New lyrics", plain_lyrics="New words"))
+        write_library_package(path, incoming, [entry.id for entry in incoming], covers=self.window.covers,
+                              lyrics_store=source, include_lyrics=True)
         with patch.object(self.window.store, "save", side_effect=OSError("disk full")):
             self.assertFalse(self.window.import_library_path(path))
         self.assertIs(self.window.entries, existing)
         self.assertEqual(self.window.store.path.read_bytes(), original)
+        self.assertFalse(self.window.lyrics_store.path.exists())
 
     def test_export_guard_protects_active_library(self):
         self.window.entries = self.entries()
         self.window._save()
-        original = self.window.store.path.read_bytes()
-        self.assertFalse(self.window.export_selection_path(self.window.store.path, [self.window.entries[0].id]))
-        self.assertEqual(self.window.store.path.read_bytes(), original)
-        self.window._error.assert_called_once()
+        song = self.window.entries[1]
+        self.window.lyrics_store.save(song.id, LyricsEntry("local:1", "Saved lyrics", plain_lyrics="Keep this"))
+        for protected in (self.window.store.path, self.window.lyrics_store.path):
+            original = protected.read_bytes()
+            self.assertFalse(self.window.export_selection_path(protected, [song.id], include_lyrics=True))
+            self.assertEqual(protected.read_bytes(), original)
+        self.assertEqual(self.window._error.call_count, 2)
 
     def test_file_dialog_cancel_does_not_import_or_export(self):
         self.window.entries = self.entries()
         self.window._render_library()
         with patch("bili_player.app.QFileDialog") as dialog, \
-             patch("bili_player.app.write_library_package") as writer:
+             patch("bili_player.app.write_library_package") as writer, \
+             patch("bili_player.app.ExportOptionsDialog.exec", return_value=QDialog.DialogCode.Rejected) as options:
             self.window.export_selection()
-            dialog.assert_not_called()
+            options.assert_not_called()
             self.window.enter_library_selection(self.window.entries[0].id)
+            self.window.batch_export_button.click()
+            options.assert_called_once_with()
+            dialog.assert_not_called()
+            writer.assert_not_called()
+            options.return_value = QDialog.DialogCode.Accepted
             dialog.return_value.exec.return_value = QDialog.DialogCode.Rejected
             self.window.batch_export_button.click()
             dialog.return_value.exec.assert_called_once_with()
             writer.assert_not_called()
-        with patch("bili_player.app.QFileDialog.getOpenFileName", return_value=("", "")) as chooser, \
+        with patch("bili_player.app.pick_files", return_value=[]) as chooser, \
              patch("bili_player.app.read_library_package") as reader:
             self.window.import_library_button.click()
             chooser.assert_called_once()
@@ -237,7 +331,7 @@ class PlayerIntegrationTests(unittest.TestCase):
 
     def test_local_import_keeps_copy_and_plays_directly(self):
         original = self.wav()
-        with patch("bili_player.app.QFileDialog.getOpenFileNames", return_value=([str(original)], "")):
+        with patch("bili_player.app.pick_files", return_value=[str(original)]):
             self.window.import_audio_button.click()
         self.wait_for_tasks()
         original.unlink()
@@ -314,7 +408,7 @@ class PlayerIntegrationTests(unittest.TestCase):
         self.addCleanup(detail.deleteLater)
         self.assertEqual(detail.local_audio_label.text(), "未下载到本地")
         with patch.object(self.window, "_source_client", return_value=client) as resolver, \
-                patch("bili_player.audio_files.network.get", return_value=response) as request:
+                patch("bili_player.stream.requests.request", return_value=response) as request:
             detail.download_button.click()
             self.assertEqual(detail.local_audio_label.text(), "正在下载音频…")
             self.wait_for_tasks()
@@ -331,7 +425,66 @@ class PlayerIntegrationTests(unittest.TestCase):
         self.assertEqual(self.window.audio_files.path(restored.tracks[0].audio_file).read_bytes(), audio_data)
         self.window._error.assert_not_called()
 
-    def test_zip_checkbox_controls_downloads_and_embeds_both_kinds_of_cover(self):
+    def test_detail_progress_counts_cached_bytes_and_restores_on_reopen(self):
+        fixture = RangeFixture()
+        self.addCleanup(fixture.close)
+        video_id = "Dvl7IEqtcz4"
+        song = LibraryEntry("Song", video_id, provider="youtube", resolved=True, tracks=[
+            Track("Song", video_id, 0, 1, duration=180, provider="youtube"),
+        ])
+        other = LibraryEntry("Other", BV, resolved=True, tracks=[Track("Other", BV, 10, 1)])
+        self.window.entries = [song, other]
+        self.window._normalize_library()
+        key, source = self.window._audio_cache_identity(song.tracks[0])
+        relay = self.window.proxy.set_stream(fixture.url, cache_key=key, source_key=source)
+        with requests.get(relay, headers={"Range": "bytes=0-10"}, timeout=4) as response:
+            self.assertEqual(response.content, fixture.data[:11])
+        fixture.seen.clear()
+        fixture.gate = threading.Event()
+        detail = EntryDetailsDialog(self.window, song)
+        unrelated = EntryDetailsDialog(self.window, other)
+        self.addCleanup(detail.deleteLater)
+        self.addCleanup(unrelated.deleteLater)
+        self.assertTrue(detail.download_progress.isHidden())
+        with patch.object(self.window, "_source_client", side_effect=AssertionError("Reuse active audio URL")):
+            try:
+                detail.download_button.click()
+                self.assertFalse(detail.download_progress.isHidden())
+                self.assertEqual(detail.download_progress.maximum(), 0)
+                deadline = time.monotonic() + 2
+                expected = BLOCK_SIZE * 100 // len(fixture.data)
+                while detail.download_progress.value() != expected and time.monotonic() < deadline:
+                    QTest.qWait(10)
+                self.assertEqual(detail.download_progress.maximum(), 100)
+                self.assertEqual(detail.download_progress.value(), expected)
+                self.assertTrue(unrelated.download_progress.isHidden())
+                reopened = EntryDetailsDialog(self.window, song)
+                self.addCleanup(reopened.deleteLater)
+                self.assertEqual(reopened.download_progress.value(), expected)
+            finally:
+                fixture.gate.set()
+                self.wait_for_tasks()
+        self.assertTrue(detail.download_progress.isHidden())
+        self.assertEqual(detail.local_audio_label.text(), "已在本地 · 可离线播放")
+        self.assertEqual(self.window.local_audio_path(song.tracks[0]).read_bytes(), fixture.data)
+        self.assertEqual(fixture.seen[0], ("GET", f"bytes={BLOCK_SIZE}-{2*BLOCK_SIZE-1}"))
+        self.window._error.assert_not_called()
+
+    def test_detail_progress_is_hidden_after_download_failure(self):
+        song = LibraryEntry("Remote", BV, resolved=True, tracks=[Track("Remote", BV, 10, 1)])
+        self.window.entries = [song]
+        detail = EntryDetailsDialog(self.window, song)
+        self.addCleanup(detail.deleteLater)
+        with patch.object(self.window.proxy, "download_audio", side_effect=ValueError("download failed")):
+            detail.download_button.click()
+            self.assertFalse(detail.download_progress.isHidden())
+            self.wait_for_tasks()
+        self.assertTrue(detail.download_progress.isHidden())
+        self.assertTrue(detail.download_button.isEnabled())
+        self.assertEqual(detail.local_audio_label.text(), "未下载到本地")
+        self.window._error.assert_called_once()
+
+    def test_zip_checkboxes_control_audio_and_lyrics_and_embed_both_kinds_of_cover(self):
         files = self.window.audio_files
         original = self.wav("local.wav")
         local_file = files.import_file(original)
@@ -354,16 +507,29 @@ class PlayerIntegrationTests(unittest.TestCase):
         response.iter_content.side_effect = lambda _: iter([data])
         album = LibraryEntry("Album", kind="album", tracks=[local.tracks[0], remote.tracks[0]], resolved=True)
         local.tracks[0].song_id, remote.tracks[0].song_id = local.id, remote.id
-        self.window.entries = [album, local, remote]
+        unselected = LibraryEntry("Unselected", BV, page=2, tracks=[Track("Unselected", BV, 2, 2)])
+        self.window.entries = [album, local, remote, unselected]
+        local_lyrics = LyricsEntry("local:1", "版本一", plain_lyrics="第一行\n第二行")
+        remote_lyrics = LyricsEntry("lrclib:1", "Instrumental", source="lrclib", instrumental=True)
+        self.window.lyrics_store.save(local.id, local_lyrics)
+        self.window.lyrics_store.save(remote.id, remote_lyrics)
+        self.window.lyrics_store.save(unselected.id, local_lyrics)
         self.window._render_library()
         self.window.enter_library_selection(album.id)
         for checked in (False, True):
             destination = self.root / f"package-{checked}.zip"
+
+            def choose_options(options):
+                self.assertFalse(options.include_lyrics.isChecked())
+                options.include_downloads.setChecked(checked)
+                options.include_lyrics.setChecked(not checked)
+                return QDialog.DialogCode.Accepted
+
             with patch("bili_player.app.QFileDialog") as dialog, \
+                    patch("bili_player.app.ExportOptionsDialog.exec", choose_options), \
                     patch("bili_player.covers.requests.get", return_value=response) as request:
                 dialog.return_value.exec.return_value = QDialog.DialogCode.Accepted
                 dialog.return_value.selectedFiles.return_value = [str(destination)]
-                dialog.return_value.layout.return_value.addWidget.side_effect = lambda checkbox, *_: checkbox.setChecked(checked)
                 self.window.export_selection()
                 self.wait_for_tasks()
                 self.assertEqual(request.call_count, int(not checked))
@@ -371,10 +537,17 @@ class PlayerIntegrationTests(unittest.TestCase):
                 self.assertEqual(len([name for name in archive.namelist() if name.startswith("covers/")]), 2)
                 self.assertEqual({name for name in archive.namelist() if name.startswith("audio/")},
                                  {f"audio/{local_file}", f"audio/{remote_file}"} if checked else {f"audio/{local_file}"})
+                self.assertEqual("lyrics.json" in archive.namelist(), not checked)
             from bili_player.audio_files import AudioFiles
             from bili_player.covers import CoverCache
             restored_files = AudioFiles(self.root / f"restored-{checked}" / "audio-files")
-            restored = read_library_package(destination, CoverCache(restored_files.directory.parent / "covers"), restored_files)
+            lyrics = {}
+            restored = read_library_package(destination, CoverCache(restored_files.directory.parent / "covers"),
+                                            restored_files, lyrics=lyrics)
+            self.assertEqual(lyrics, {} if checked else {
+                local.id: SongLyrics((local_lyrics,), local_lyrics.id),
+                remote.id: SongLyrics((remote_lyrics,), remote_lyrics.id),
+            })
             restored_album, restored_local, restored_remote = restored
             self.assertIs(restored_album.tracks[0], restored_local.tracks[0])
             self.assertIs(restored_album.tracks[1], restored_remote.tracks[0])

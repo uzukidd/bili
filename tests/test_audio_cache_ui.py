@@ -136,7 +136,7 @@ class AudioCacheUITests(unittest.TestCase):
         response._content = b""
         response._content_consumed = True
         with patch.object(self.window, "_source_client", return_value=client), \
-                patch("bili_player.audio_files.network.get", return_value=response):
+                patch("bili_player.stream.requests.request", return_value=response):
             self.window.download_audio(song)
             load, _, failed = pending[0]
             with self.assertRaisesRegex(ValueError, "HTTP 403") as raised:
@@ -166,7 +166,7 @@ class AudioCacheUITests(unittest.TestCase):
         song = self.song()
         self.window._append_tracks(copy_tracks(song.tracks))
         ids = [entry.id for entry in self.window.entries]
-        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Cancel), \
+        with patch("bili_player.app.show_message", return_value=QMessageBox.StandardButton.Cancel), \
              patch.object(self.window.proxy, "clear_cache") as clear:
             self.window.clear_audio_cache()
             clear.assert_not_called()
@@ -174,7 +174,7 @@ class AudioCacheUITests(unittest.TestCase):
         self.window._submit = lambda fn, done, error=None: jobs.append((fn, done, error))
         self.window._settings_dialog = SettingsDialog(self.window)
         self.window._refresh_settings()
-        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+        with patch("bili_player.app.show_message", return_value=QMessageBox.StandardButton.Yes):
             self.window._settings_dialog.clear_cache_button.click()
         self.assertFalse(self.window._settings_dialog.clear_cache_button.isEnabled())
         jobs[0][1]({"removed_bytes": 1024 ** 2, "pending_bytes": 2 * 1024 ** 2})
@@ -190,7 +190,7 @@ class AudioCacheUITests(unittest.TestCase):
         self.window.set_language("en_US")
         self.window._settings_dialog = SettingsDialog(self.window)
         self.window._refresh_settings()
-        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+        with patch("bili_player.app.show_message", return_value=QMessageBox.StandardButton.Yes):
             self.window._settings_dialog.clear_cache_button.click()
         jobs[0][2]("Disk unavailable")
         self.assertTrue(self.window._settings_dialog.clear_cache_button.isEnabled())

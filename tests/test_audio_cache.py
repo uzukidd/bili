@@ -85,6 +85,21 @@ class AudioCacheTests(unittest.TestCase):
         self.cache.deactivate(refreshed)
         self.assertEqual(self.cache.info()["bytes"], 0)
 
+    def test_youtube_partial_blocks_survive_new_signature_but_not_media_revision(self):
+        source = 'youtube:fixture:0:1:best-audio-v1'
+        base = 'https://r1.example.googlevideo.com/videoplayback?id=fixture&itag=140&clen=400000&lmt='
+        first = self.cache.activate('youtube', source, base + '123&expire=1&sig=old', download=True)
+        self.cache.representation(first, 400000, 'audio/mp4', '')
+        self.cache.write_block(first, 0, b'a' * BLOCK_SIZE)
+        self.cache.release(first)
+        reopened = AudioCache(self.root)
+        resumed = reopened.activate('youtube', source, base + '123&expire=2&sig=new', download=True)
+        self.assertEqual(reopened.read_block(resumed, 0), b'a' * BLOCK_SIZE)
+        reopened.release(resumed)
+        changed = reopened.activate('youtube', source, base + '456&expire=3&sig=newer', download=True)
+        self.assertIsNone(reopened.read_block(changed, 0))
+        reopened.release(changed)
+
     def test_lru_trims_to_target_and_protects_active_and_readers(self):
         cache = AudioCache(self.root, max_bytes=3 * BLOCK_SIZE, target_bytes=BLOCK_SIZE)
         entries = []

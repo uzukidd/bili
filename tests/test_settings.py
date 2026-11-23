@@ -103,7 +103,7 @@ class SettingsTests(unittest.TestCase):
         self.assertIn("Get cookies.txt LOCALLY", dialog.youtube_cookie_hint.text())
         self.assertIn("robots.txt", dialog.youtube_cookie_hint.text())
         self.assertIn("请勿分享", dialog.youtube_cookie_hint.text())
-        with patch("bili_player.settings_dialog.QFileDialog.getOpenFileName", return_value=(str(cookies), "")):
+        with patch("bili_player.settings_dialog.pick_files", return_value=[str(cookies)]):
             dialog.youtube_cookie_choose.click()
         self.assertEqual(dialog.youtube_cookie_path.text(), str(cookies.resolve()))
         self.assertNotIn("dummy-secret", self.path.read_text(encoding="utf-8"))
