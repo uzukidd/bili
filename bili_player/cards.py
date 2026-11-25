@@ -441,6 +441,19 @@ class LibraryGrid(QWidget):
                 child.installEventFilter(self)
         self.reflow()
 
+    def reorder_cards(self, entry_ids):
+        if entry_ids == [card.entry_id for card in self._cards]:
+            return
+        cards_by_id = {card.entry_id: card for card in self._cards}
+        items_by_id = {}
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            items_by_id[item.widget().entry_id] = item
+        self._cards = [cards_by_id[entry_id] for entry_id in entry_ids]
+        for index, entry_id in enumerate(entry_ids):
+            row, column = divmod(index, self._columns)
+            self.grid.addItem(items_by_id[entry_id], row, column)
+
     def show_empty(self, widget):
         self._empty = widget
         self.grid.addWidget(widget, 0, 0)
@@ -457,7 +470,12 @@ class LibraryGrid(QWidget):
             self._empty.setFixedWidth(width)
             self.setMinimumHeight(self._empty.sizeHint().height() + margins.bottom())
             return
+        live_cards = [card for card in self._cards if not sip.isdeleted(card)]
+        if len(live_cards) != len(self._cards):
+            self._cards = live_cards
+            self._side = 0
         if not self._cards:
+            self.setMinimumHeight(0)
             return
         gap = self.grid.spacing()
         preferred = round(248 * self.scale)

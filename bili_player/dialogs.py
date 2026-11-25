@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from PyQt6.QtCore import QItemSelectionModel, Qt
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMessageBox, QPushButton, QSpinBox, QVBoxLayout,
 )
@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 from .api import BilibiliClient
 from .i18n import translate
 from .models import LibraryEntry, Track, normalize_bvid, normalize_youtube_id
+from .window_dialogs import exec_for_window, pick_files, show_message
 from .youtube import YouTubeClient
 
 
@@ -34,6 +35,8 @@ def _source_fields(provider: str) -> tuple[str, str, str]:
 
 
 def _format_source(item: LibraryEntry | Track) -> str:
+    if item.provider == "local":
+        return ""
     if item.provider == "youtube":
         return f"YouTube · {item.bvid}"
     return f"{item.bvid} · P{item.page}"
@@ -60,12 +63,12 @@ class _Dialog(QDialog):
         return widget
 
     def _choose_cover(self, title, target):
-        filename, _ = QFileDialog.getOpenFileName(
-            self, self.tr(title), "",
+        files = pick_files(
+            QFileDialog, self, self.tr(title),
             self.tr("图片文件 (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;所有文件 (*)"),
         )
-        if filename:
-            target.setText(str(Path(filename).expanduser().resolve()))
+        if files:
+            target.setText(str(Path(files[0]).expanduser().resolve()))
 
     def _buttons(self, layout: QVBoxLayout) -> QDialogButtonBox:
         buttons = QDialogButtonBox(
@@ -80,6 +83,22 @@ class _Dialog(QDialog):
         layout.addWidget(buttons)
         self.buttons = buttons
         return buttons
+
+
+class ExportOptionsDialog(_Dialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle(self.tr("批量导出"))
+        layout = QVBoxLayout(self)
+        description = self._label(self.tr("本地导入的音频和所有封面始终包含在 ZIP 中。"))
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        self.include_downloads = QCheckBox(self.tr("包含已下载的音频"))
+        self.include_lyrics = QCheckBox(self.tr("包含歌词"))
+        layout.addWidget(self.include_downloads)
+        layout.addWidget(self.include_lyrics)
+        self._buttons(layout)
+        self.save_button.setText(self.tr("选择保存位置…"))
 
 
 class EntryDialog(_Dialog):
@@ -109,6 +128,8 @@ class EntryDialog(_Dialog):
         self.source_input.addItem(self.tr("哔哩哔哩"), "bilibili")
         if not bilibili_only or (entry is not None and entry.provider == "youtube"):
             self.source_input.addItem("YouTube", "youtube")
+        if entry is not None and entry.provider == "local":
+            self.source_input.addItem(self.tr("本地音频"), "local")
         if entry is not None:
             self.source_input.setCurrentIndex(self.source_input.findData(entry.provider))
             self.source_input.setEnabled(False)
@@ -159,9 +180,10 @@ class EntryDialog(_Dialog):
             self.kind_input.setCurrentIndex(self.kind_input.findData("single"))
             self.page_input.setValue(1)
         self.kind_input.setEnabled(not youtube and (self.entry is None or self.entry.kind != "single"))
-        self.form.setRowVisible(self.kind_input, not youtube)
-        self.form.setRowVisible(self.page_input, not youtube)
-        self.album_hint.setVisible(not youtube)
+        self.form.setRowVisible(self.kind_input, provider == "bilibili")
+        self.form.setRowVisible(self.page_input, provider == "bilibili")
+        self.form.setRowVisible(self.bvid_input, provider != "local")
+        self.album_hint.setVisible(provider == "bilibili")
         label, placeholder, _ = _source_fields(provider)
         self.bvid_label.setText(self.tr(label))
         self.bvid_input.setPlaceholderText(self.tr(placeholder))
@@ -178,9 +200,9 @@ class EntryDialog(_Dialog):
         provider = self.entry.provider if self.entry is not None else self.source_input.currentData()
         youtube = provider == "youtube"
         normalize = normalize_youtube_id if youtube else normalize_bvid
-        bvid = normalize(self.bvid_input.text())
+        bvid = self.entry.bvid if provider == "local" else normalize(self.bvid_input.text())
         changes = {
-            "title": self.title_input.text().strip() or bvid,
+            "title": self.title_input.text().strip() or (self.entry.title if provider == "local" else bvid),
             "bvid": bvid,
             "provider": provider,
             "kind": "single" if youtube else self.kind_input.currentData(),
@@ -240,15 +262,17 @@ class TrackDialog(_Dialog):
         form.addRow(self.tr("曲目名称"), self.title_input)
         form.addRow(self.tr("作者"), self.artist_input)
         form.addRow(self.tr("日期"), self.date_input)
-        form.addRow(self.tr(label), self.bvid_input)
-        if not youtube:
+        if track.provider != "local":
+            form.addRow(self.tr(label), self.bvid_input)
+        if track.provider == "bilibili":
             form.addRow(self.tr("分 P"), self.page_input)
         layout.addLayout(form)
         hint = self._label(self.tr(
             "更改视频 ID 后会重新读取音频信息。" if youtube else "更改 BV 或分 P 后会重新读取音频信息。",
         ), "muted")
         hint.setWordWrap(True)
-        layout.addWidget(hint)
+        if track.provider != "local":
+            layout.addWidget(hint)
         self.error = self._label()
         self.error.setObjectName("dialogError")
         self.error.setWordWrap(True)
@@ -259,6 +283,9 @@ class TrackDialog(_Dialog):
         title = self.title_input.text().strip()
         if not title:
             raise ValueError(self.tr("请输入曲目名称。"))
+        if self.track.provider == "local":
+            return replace(self.track, title=title, artist=self.artist_input.text().strip(),
+                           date=self.date_input.text().strip())
         youtube = self.track.provider == "youtube"
         normalize = normalize_youtube_id if youtube else normalize_bvid
         return replace(
@@ -524,8 +551,8 @@ class AlbumDialog(_Dialog):
 
     def _show_error(self, message: str):
         if self._alive:
-            QMessageBox.warning(
-                self, self.tr("操作失败"),
+            show_message(
+                self, QMessageBox.Icon.Warning, self.tr("操作失败"),
                 self.tr("无法完成操作，请稍后重试。\n{error}", error=message),
             )
 
@@ -543,7 +570,7 @@ class AlbumDialog(_Dialog):
 
     def add_bv(self, *_):
         dialog = EntryDialog(self, language=self.language, bilibili_only=True)
-        if dialog.exec() != QDialog.DialogCode.Accepted or not self._alive:
+        if exec_for_window(dialog) != QDialog.DialogCode.Accepted or not self._alive:
             return
         source = dialog.value()
 
@@ -562,7 +589,7 @@ class AlbumDialog(_Dialog):
 
     def add_existing_singles(self, *_):
         dialog = _SinglesDialog(self, self.singles, language=self.language)
-        if dialog.exec() != QDialog.DialogCode.Accepted or not self._alive:
+        if exec_for_window(dialog) != QDialog.DialogCode.Accepted or not self._alive:
             return
         selected = dialog.value()
         if not selected:
@@ -605,7 +632,7 @@ class AlbumDialog(_Dialog):
             self._update_controls()
             return
         dialog = TrackDialog(self, original, language=self.language)
-        if dialog.exec() != QDialog.DialogCode.Accepted or not self._alive:
+        if exec_for_window(dialog) != QDialog.DialogCode.Accepted or not self._alive:
             return
         edited = dialog.value()
 

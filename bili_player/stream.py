@@ -26,6 +26,16 @@ class UpstreamError(OSError):
     pass
 
 
+class _UpstreamStatus(UpstreamError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f"Audio upstream status {status}")
+
+
+class _RestartDownload(UpstreamError):
+    pass
+
+
 @dataclass(eq=False)
 class _Stream:
     url: str
@@ -316,18 +326,18 @@ class StreamProxy:
         finally:
             self._close_response(response)
 
-    def _fetch(self, stream, index):
+    def _fetch(self, stream, index, *, use_cache=True):
         """Called with entry.download_lock. Return a verified block or full-200 response."""
         entry = stream.entry
         self._check(stream)
-        cached = self._cache.read_block(entry, index)
+        cached = self._cache.read_block(entry, index) if use_cache else None
         if cached is not None:
             return cached, None
         if not stream.url:
             raise UpstreamError("Cached block is unavailable")
         start = index * BLOCK_SIZE
         end = start + BLOCK_SIZE - 1
-        if entry.size is not None:
+        if entry.size is not None and use_cache:
             end = min(end, entry.size - 1)
         headers = {"Accept-Encoding": "identity", "Range": f"bytes={start}-{end}"}
         if entry.etag and not entry.etag.startswith("W/"):
@@ -337,9 +347,13 @@ class StreamProxy:
             response = None
             try:
                 response = self._request(stream, "GET", headers, attempts=1)
+                if response.status_code not in (200, 206):
+                    raise _UpstreamStatus(response.status_code)
                 content_type = _content_type(response)
                 etag = response.headers.get("ETag", "")
                 if response.status_code == 200:
+                    if response.headers.get("Content-Range"):
+                        raise UpstreamError("Unexpected Content-Range on full response")
                     size = int(response.headers.get("Content-Length", "0"))
                     if size <= 0:
                         if "Content-Length" in response.headers:
@@ -347,8 +361,6 @@ class StreamProxy:
                         return None, response
                     self._cache.representation(entry, size, content_type, etag)
                     return None, response
-                if response.status_code != 206:
-                    raise UpstreamError(f"Audio upstream status {response.status_code}")
                 match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)",
                                      response.headers.get("Content-Range", ""))
                 if not match:
@@ -383,9 +395,11 @@ class StreamProxy:
                 self._check(stream)
             # Never keep a failed attempt's error as state for a successful full-200 retry.
             error, previous = None, error
+        if isinstance(previous, _UpstreamStatus):
+            raise previous
         raise UpstreamError("Cannot download verified audio block") from previous
 
-    def _body(self, stream, start, end, revision, initial=None, full=None):
+    def _body(self, stream, start, end, revision, initial=None, full=None, *, downloading=False):
         entry = stream.entry
         try:
             index = start // BLOCK_SIZE
@@ -399,8 +413,15 @@ class StreamProxy:
                             if index == 0 and initial is not None:
                                 data, initial = initial, None
                             else:
-                                data, full = self._fetch(stream, index)
-                if entry.revision != revision:
+                                try:
+                                    data, full = self._fetch(stream, index)
+                                except _UpstreamStatus as exc:
+                                    if downloading and index > 0 and exc.status == 416:
+                                        raise _RestartDownload() from exc
+                                    raise
+                if entry.revision != revision or (downloading and full is not None and index > 0):
+                    if downloading:
+                        raise _RestartDownload()
                     raise UpstreamError("Audio representation changed during playback")
                 if full is not None:
                     # Never keep the entry lock while yielding to a socket: FFmpeg
@@ -488,6 +509,119 @@ class StreamProxy:
                 return self._activate(_Stream("", entry))
             finally:
                 self._cache.release(entry)
+
+    def save_cached_audio(self, cache_key: str, source_key: str, save) -> str | None:
+        if not self._cache or self._closed.is_set():
+            return None
+        entry = self._cache.acquire_complete(cache_key, source_key)
+        if entry is None:
+            return None
+        try:
+            with entry.download_lock:
+                size, revision = entry.size, entry.revision
+
+                def chunks():
+                    for index in range((size + BLOCK_SIZE - 1) // BLOCK_SIZE):
+                        data = self._cache.read_block(entry, index)
+                        if data is None or entry.revision != revision:
+                            raise UpstreamError("Incomplete cached audio")
+                        yield data
+
+                try:
+                    return save(entry.content_type, chunks(), size=size)
+                except UpstreamError:
+                    return None
+        finally:
+            self._cache.release(entry)
+
+    def download_audio(self, cache_key, source_key, resolve, save, *, allow_cached=False):
+        """Save the complete representation using the same verified range reader as playback."""
+        cached_source = None
+        if allow_cached:
+            try:
+                saved = self.save_cached_audio(cache_key, source_key, save)
+            except ValueError:
+                saved = None  # Unknown MIME can still be resolved from a fresh URL's suffix.
+            if saved is not None:
+                return saved
+            with self._lock:
+                cached_source = next((stream for stream in self._streams.values() if stream.url and stream.entry
+                                      and (stream.entry.key, stream.entry.source) == (cache_key, source_key)), None)
+
+        try:
+            if cached_source is not None:
+                try:
+                    return self._download_ranges(cached_source.url, cached_source.http_headers, cache_key, source_key, save)
+                except _UpstreamStatus as exc:
+                    if exc.status not in (401, 403, 410):
+                        raise
+            url = resolve()
+            return self._download_ranges(url, getattr(url, "http_headers", None), cache_key, source_key, save)
+        except _UpstreamStatus as exc:
+            if exc.status == 403:
+                raise ValueError("音频服务器拒绝下载请求（HTTP 403）") from None
+            raise ValueError(f"音频请求失败（HTTP {exc.status}）") from None
+        except (UpstreamError, RequestException):
+            raise ValueError("下载音频时网络请求失败") from None
+
+    def _download_ranges(self, url, headers, key, source, save):
+        if self._cache is None:
+            raise UpstreamError("Audio cache unavailable")
+        stream = _Stream(url, http_headers=headers)
+        self._check(stream)
+        confirmed = self._cache.cached_validator(key, source, url)
+        if confirmed:
+            # Compare strong validators before reusing any bytes from an unrelated URL.
+            _, size, etag = confirmed
+            try:
+                response = self._request(stream, "HEAD", {"Accept-Encoding": "identity"}, attempts=1)
+            except UpstreamError:
+                confirmed = None
+            else:
+                try:
+                    if (response.status_code != 200 or response.headers.get("ETag") != etag
+                            or response.headers.get("Content-Length") != str(size)):
+                        confirmed = None
+                finally:
+                    self._close_response(response)
+        stream.entry = self._cache.activate(key, source, url, download=True, confirmed=confirmed)
+        try:
+            try:
+                return self._save_download(stream, save)
+            except _RestartDownload:
+                # A late 200 or changed validator invalidated the in-progress output.
+                return self._save_download(stream, save, from_zero=True)
+        finally:
+            self._cache.release(stream.entry)
+
+    def _save_download(self, stream, save, *, from_zero=False):
+        entry = stream.entry
+        with entry.download_lock:
+            first, full = self._fetch(stream, 0, use_cache=not from_zero)
+            size, revision = entry.size, entry.revision
+        if full is not None:
+            try:
+                def chunks():
+                    for data in full.iter_content(BLOCK_SIZE):
+                        self._check(stream)
+                        yield data
+
+                if "Content-Length" not in full.headers:
+                    return save(_content_type(full), chunks(), size=None, url=stream.url)
+                body = self._full_body(stream, full, 0, size - 1, revision)
+                try:
+                    return save(entry.content_type, body, size=size, url=stream.url)
+                finally:
+                    body.close()
+            finally:
+                if full in self._responses:
+                    self._close_response(full)
+        # Close the generator on disk failure or a rejected file size/format.
+        body = self._body(stream, 0, size - 1, revision, first, downloading=True)
+        try:
+            return save(entry.content_type, body, size=size, url=stream.url)
+        finally:
+            body.close()
 
     def release_stream(self) -> None:
         with self._lock:

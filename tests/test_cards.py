@@ -120,6 +120,22 @@ class TileTests(unittest.TestCase):
         self.assertEqual([c.entry_id for c in self.cards()], [song.id])
         self.assertIs(self.window._find(song.id), song)
 
+    def test_single_subtitle_uses_album_and_artist_when_available(self):
+        album, song, other_album, uncredited = self.entries
+        self.window._normalize_library()
+        self.window.tabs.setCurrentIndex(2)
+
+        def subtitles():
+            self.window._render_library()
+            return {card.entry_id: card.subtitle_label.full_text for card in self.cards()}
+
+        self.assertEqual(subtitles(), {song.id: "Manually entered", uncredited.id: "单曲"})
+        album.tracks = [song.tracks[0], Track("Uncredited", BV, 456, 2, song_id=uncredited.id)]
+        other_album.tracks = list(song.tracks)
+        self.assertEqual(subtitles(), {song.id: "First album · Manually entered", uncredited.id: "First album"})
+        uncredited.artist = "New artist"
+        self.assertEqual(subtitles()[uncredited.id], "First album · New artist")
+
     def test_album_and_single_covers_remain_square_after_resize_and_filter(self):
         for width in (1020, 1220, 1600):
             self.window.resize(width, 820)
@@ -172,6 +188,39 @@ class TileTests(unittest.TestCase):
             reopened._quitting = True
             reopened.close()
             reopened.deleteLater()
+
+    def test_drop_keeps_scroll_position_in_a_multirow_library(self):
+        self.window.entries = [
+            LibraryEntry(f"Album {index}", kind="album", resolved=True) if index % 2 == 0 else
+            LibraryEntry(f"Single {index}", BV, page=index)
+            for index in range(24)
+        ]
+        self.window._render_library()
+        QTest.qWait(30)
+        bar = self.window.library_scroll.verticalScrollBar()
+        source, target = self.cards()[6:8]
+        source.artwork.setFocus()
+        position = source.y() - 25
+        self.assertGreater(position, 0)
+        self.assertGreater(bar.maximum(), position)
+        bar.setValue(position)
+
+        mime = self.mime(source)
+        target.dropEvent(InternalDrop(source, mime))
+        QTest.qWait(30)
+
+        self.assertEqual(bar.value(), position)
+        self.assertIs(self.app.focusWidget(), source.artwork)
+        self.assertEqual(self.cards()[6:8], [target, source])
+
+        self.window._card_drag_state(True)
+        self.window.entries.append(LibraryEntry("Background update", kind="album", resolved=True))
+        self.window._render_library()
+        self.window._card_drag_state(False)
+        QTest.qWait(30)
+
+        self.assertEqual(bar.value(), position)
+        self.assertEqual(len(self.cards()), 25)
 
     def test_filtered_swap_changes_only_two_global_positions(self):
         self.window.tabs.setCurrentIndex(1)

@@ -140,7 +140,7 @@ class MetadataDialogTests(unittest.TestCase):
         dialog = self.entry_dialog(original)
         self.assertEqual(dialog.cover_input.text(), original.cover)
         picture = os.path.abspath("new cover.png")
-        with patch("bili_player.dialogs.QFileDialog.getOpenFileName", return_value=(picture, "")):
+        with patch("bili_player.dialogs.pick_files", return_value=[picture]):
             choose_button = next(button for button in dialog.findChildren(QPushButton)
                                  if button.text() == "选择图片")
             choose_button.click()

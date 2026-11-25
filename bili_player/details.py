@@ -8,13 +8,14 @@ from PyQt6.QtCore import QEvent, QItemSelectionModel, QPointF, QRectF, QSignalBl
 from PyQt6.QtGui import QKeySequence, QMouseEvent, QPainter, QPainterPath, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
-    QLabel, QListWidget, QListWidgetItem, QMenu, QPushButton, QScrollArea, QSizePolicy,
+    QLabel, QListWidget, QListWidgetItem, QMenu, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
     QVBoxLayout, QWidget, QStyledItemDelegate,
 )
 
 from .i18n import translate
 from .models import LibraryEntry, Track
 from .window_chrome import FramelessController, TitleBar
+from .window_dialogs import exec_for_window
 
 
 def _duration(seconds: int) -> str:
@@ -196,6 +197,15 @@ class EntryDetailsDialog(QDialog):
         self.source_label = self._label(name="muted")
         self.source_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         information.addWidget(self.source_label)
+        self.local_audio_label = self._label(name="muted")
+        information.addWidget(self.local_audio_label)
+        self.download_progress = QProgressBar()
+        self.download_progress.setObjectName("audioDownloadProgress")
+        self.download_progress.setAccessibleName(self.tr("音频下载进度"))
+        self.download_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.download_progress.setFixedHeight(18)
+        self.download_progress.hide()
+        information.addWidget(self.download_progress)
         information.addStretch()
         self.information_opacity = QGraphicsOpacityEffect(self.information_widget)
         self.information_widget.setGraphicsEffect(self.information_opacity)
@@ -274,6 +284,8 @@ class EntryDetailsDialog(QDialog):
         self.close_button = self._button("关闭", self.accept)
         for widget in (self.play_button, self.queue_button, self.edit_button, self.copy_button):
             actions.addWidget(widget)
+        self.download_button = self._button("下载到本地", lambda: self._owner.download_audio(self.entry))
+        actions.addWidget(self.download_button)
         actions.addStretch()
         actions.addWidget(self.close_button)
         layout.addLayout(actions)
@@ -284,9 +296,12 @@ class EntryDetailsDialog(QDialog):
             self.scroll_area.setMinimumHeight(self.hero.height() + lyrics_height + 2 * self.scroll_area.frameWidth())
             window_layout.activate()
             self.resize(700, window_layout.minimumSize().height())
-        changed = getattr(parent, "libraryChanged", None)
+        changed = getattr(self._owner, "libraryChanged", None)
         if changed is not None:
             changed.connect(self.refresh)
+        progress_changed = getattr(self._owner, "audioDownloadProgressChanged", None)
+        if is_single and progress_changed is not None:
+            progress_changed.connect(self._refresh_download_progress)
 
     def tr(self, text: str, **values) -> str:
         return translate(text, language=self.language, **values)
@@ -391,7 +406,7 @@ class EntryDetailsDialog(QDialog):
         title = entry.title or (entry.tracks[0].title if entry.tracks else "")
         dialog = LyricsSearchDialog(self, title, submit=submit, language=self.language)
         try:
-            if dialog.exec() != QDialog.DialogCode.Accepted or sip.isdeleted(dialog):
+            if exec_for_window(dialog) != QDialog.DialogCode.Accepted or sip.isdeleted(dialog):
                 return
             selected = dialog.selected_lyrics
         finally:
@@ -468,6 +483,20 @@ class EntryDetailsDialog(QDialog):
         self.entry = current
         return current
 
+    def _refresh_download_progress(self, song_id=None):
+        if song_id is not None and song_id != self.entry.id:
+            return
+        lookup = getattr_static(self._owner, "audio_download_progress", None)
+        progress = self._owner.audio_download_progress(self.entry) if self.entry.kind == "single" and callable(lookup) else None
+        if progress is None:
+            self.download_progress.hide()
+            return
+        self.download_progress.setRange(0, 0 if progress < 0 else 100)
+        self.download_progress.setTextVisible(progress >= 0)
+        if progress >= 0:
+            self.download_progress.setValue(progress)
+        self.download_progress.show()
+
     def refresh(self):
         entry = self._current_entry()
         if entry is None:
@@ -480,9 +509,11 @@ class EntryDetailsDialog(QDialog):
         is_single = entry.kind == "single"
         self.hero.setFixedHeight(340 if is_single else 256)
         self.cover_slot.setFixedWidth(280 if is_single else 212)
+        seconds = sum(track.duration for track in entry.tracks)
+        duration = "—" if any(track.audio_file and not track.duration for track in entry.tracks) else _duration(seconds)
         self.meta_label.setText(self.tr(
             "单曲 · {duration}" if is_single else "专辑 · {count} 首 · {duration}",
-            count=len(entry.tracks), duration=_duration(sum(track.duration for track in entry.tracks)),
+            count=len(entry.tracks), duration=duration,
         ))
         if is_single:
             author = entry.artist or (entry.tracks[0].artist if entry.tracks else "")
@@ -500,6 +531,21 @@ class EntryDetailsDialog(QDialog):
             self.date_label.setText(self.tr("日期：{date}", date=date) if date else "")
             self.date_label.setVisible(bool(date))
         source = f"YouTube · {entry.bvid}" if entry.provider == "youtube" else entry.bvid
+        if entry.provider == "local":
+            source = self.tr("本地音频")
+        track = entry.tracks[0] if is_single and entry.tracks else None
+        lookup = getattr_static(self._owner, "local_audio_path", None)
+        local = bool(track and callable(lookup) and self._owner.local_audio_path(track))
+        pending = (callable(getattr_static(self._owner, "audio_download_pending", None))
+                   and self._owner.audio_download_pending(entry))
+        self.local_audio_label.setText(self.tr("已在本地 · 可离线播放" if local else
+                                               "正在下载音频…" if pending else
+                                               "找不到本地音频文件" if entry.provider == "local" else "未下载到本地"))
+        self.local_audio_label.setVisible(is_single)
+        self.download_button.setVisible(bool(track and entry.provider != "local" and not local
+                                             and callable(getattr_static(self._owner, "download_audio", None))))
+        self.download_button.setEnabled(not pending)
+        self._refresh_download_progress()
         self.source_label.setText(self.tr("来源：{bvid}", bvid=source) if source else "")
         self.source_label.setVisible(bool(source))
         self.tracks_list.clear()
@@ -507,7 +553,7 @@ class EntryDetailsDialog(QDialog):
         for index, track in enumerate(entry.tracks if not is_single else [], 1):
             title = track.title or (entry.title if entry.kind == "single" else track.bvid)
             metadata = " · ".join(part for part in (
-                track.artist.strip(), _duration(track.duration),
+                track.artist.strip(), "—" if track.audio_file and not track.duration else _duration(track.duration),
                 "YouTube" if track.provider == "youtube" else "",
             ) if part)
             item = QListWidgetItem(f"{index}.  {title}\n{metadata}")

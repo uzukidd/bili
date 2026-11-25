@@ -1,6 +1,7 @@
 """Offline lyrics storage, line-synced display, and LRCLIB lookups."""
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -10,7 +11,8 @@ import tempfile
 import threading
 import time
 from bisect import bisect_right
-from dataclasses import asdict, dataclass
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, replace
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -129,6 +131,85 @@ class SongLyrics:
     def active(self) -> LyricsEntry | None:
         return next((entry for entry in self.entries if entry.id == self.active_id), None)
 
+    @classmethod
+    def from_dict(cls, value: object) -> SongLyrics:
+        if not isinstance(value, dict) or not isinstance(value.get("entries"), list):
+            raise ValueError("Invalid lyrics for song")
+        try:
+            entries = tuple(LyricsEntry(**item) for item in value["entries"])
+        except TypeError as exc:
+            raise ValueError("Invalid lyrics entry") from exc
+        active_id = value.get("active_id")
+        ids = {entry.id for entry in entries}
+        if len(ids) != len(entries) or (active_id is not None and (
+            not isinstance(active_id, str) or active_id not in ids
+        )):
+            raise ValueError("Invalid lyrics entry IDs")
+        return cls(entries, active_id)
+
+    def merge(self, incoming: SongLyrics) -> SongLyrics:
+        """Keep local choices and add imported versions without overwriting edits."""
+        if not self.entries:
+            return incoming
+        entries = {entry.id: entry for entry in self.entries}
+        reserved = {entry.id: entry for entry in incoming.entries}
+        for entry in incoming.entries:
+            current = entries.get(entry.id)
+            if current is None:
+                entries[entry.id] = entry
+            elif current != entry:
+                # The same archive always resolves an ID collision the same way.
+                data = json.dumps(asdict(entry), sort_keys=True).encode("ascii")
+                base = f"imported:{hashlib.sha256(data).hexdigest()}"
+                candidate = base
+                suffix = 0
+                while True:
+                    alternate = replace(entry, id=candidate)
+                    if (entries.get(candidate, alternate) == alternate
+                            and reserved.get(candidate, alternate) == alternate):
+                        entries[candidate] = alternate
+                        break
+                    suffix += 1
+                    candidate = f"{base}:{suffix}"
+        return SongLyrics(tuple(entries.values()), self.active_id)
+
+
+def _lyrics_songs(data: object) -> dict:
+    if (not isinstance(data, dict) or type(data.get("version")) is not int
+            or data["version"] != 1 or not isinstance(data.get("songs"), dict)):
+        raise ValueError("Unsupported lyrics file format")
+    return data["songs"]
+
+
+def _lyrics_payload(songs: dict) -> dict:
+    return {"version": 1, "songs": songs}
+
+
+def dumps_lyrics(songs: dict[str, SongLyrics]) -> str:
+    return json.dumps(_lyrics_payload({key: asdict(song) for key, song in songs.items()}),
+                      ensure_ascii=False, indent=2) + "\n"
+
+
+def loads_lyrics(text: str, song_ids: set[str]) -> dict[str, SongLyrics]:
+    def unique_fields(pairs):
+        fields = dict(pairs)
+        if len(fields) != len(pairs):
+            raise ValueError("Duplicate lyrics field")
+        return fields
+
+    songs = _lyrics_songs(json.loads(text, object_pairs_hook=unique_fields))
+    if songs.keys() - song_ids:
+        raise ValueError("Unknown song ID in lyrics")
+    decoded = {key: SongLyrics.from_dict(song) for key, song in songs.items()}
+    for key, song in decoded.items():
+        # JSON escapes can represent invalid Unicode even in a UTF-8 file.
+        key.encode("utf-8")
+        for entry in song.entries:
+            for value in (entry.id, entry.title, entry.source, entry.artist,
+                          entry.plain_lyrics, entry.synced_lyrics):
+                value.encode("utf-8")
+    return decoded
+
 
 class LyricsStore:
     """A versioned sidecar file keyed by persistent song entity ID."""
@@ -147,35 +228,23 @@ class LyricsStore:
                 data = json.load(source)
         except FileNotFoundError:
             return {}
-        if (not isinstance(data, dict) or type(data.get("version")) is not int
-                or data["version"] != 1 or not isinstance(data.get("songs"), dict)):
-            raise ValueError("Unsupported lyrics file format")
-        return data["songs"]
+        return _lyrics_songs(data)
 
     @staticmethod
     def _song(songs: dict, song_key: str) -> SongLyrics:
         if song_key not in songs:
             return SongLyrics()
-        value = songs[song_key]
-        if not isinstance(value, dict) or not isinstance(value.get("entries"), list):
-            raise ValueError("Invalid lyrics for song")
-        try:
-            entries = tuple(LyricsEntry(**item) for item in value["entries"])
-        except TypeError as exc:
-            raise ValueError("Invalid lyrics entry") from exc
-        active_id = value.get("active_id")
-        ids = {entry.id for entry in entries}
-        if len(ids) != len(entries) or (active_id is not None and (
-            not isinstance(active_id, str) or active_id not in ids
-        )):
-            raise ValueError("Invalid lyrics entry IDs")
-        return SongLyrics(entries, active_id)
+        return SongLyrics.from_dict(songs[song_key])
 
     def _write(self, songs: dict, song_key: str, updated: SongLyrics) -> SongLyrics:
         if updated.entries:
             songs[song_key] = asdict(updated)
         else:
             songs.pop(song_key, None)
+        self._write_songs(songs)
+        return updated
+
+    def _write_songs(self, songs: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
@@ -184,7 +253,7 @@ class LyricsStore:
                 prefix=self.path.name + ".", suffix=".tmp", delete=False,
             ) as handle:
                 temporary = Path(handle.name)
-                json.dump({"version": 1, "songs": songs}, handle, ensure_ascii=False, indent=2)
+                json.dump(_lyrics_payload(songs), handle, ensure_ascii=False, indent=2)
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -193,7 +262,35 @@ class LyricsStore:
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-        return updated
+
+    def load_many(self, song_keys: Iterable[str]) -> dict[str, SongLyrics]:
+        """Read one snapshot containing only the requested songs with lyrics."""
+        with _STORE_LOCK:
+            songs = self._read()
+            snapshot = {}
+            for key in song_keys:
+                self._validate_key(key)
+                song = self._song(songs, key)
+                if song.entries:
+                    snapshot[key] = song
+            return snapshot
+
+    def merge(self, incoming: dict[str, SongLyrics]) -> None:
+        """Merge imported songs in a single atomic sidecar update."""
+        if not incoming:
+            return
+        with _STORE_LOCK:
+            songs = self._read()
+            changed = False
+            for key, imported in incoming.items():
+                self._validate_key(key)
+                song = self._song(songs, key)
+                updated = song.merge(imported)
+                if updated != song:
+                    songs[key] = asdict(updated)
+                    changed = True
+            if changed:
+                self._write_songs(songs)
 
     def load(self, song_key: str) -> SongLyrics:
         self._validate_key(song_key)

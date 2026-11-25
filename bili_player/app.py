@@ -4,6 +4,7 @@ import sys
 import time
 import weakref
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
@@ -19,29 +20,32 @@ from PyQt6.QtGui import (
 from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame,
-    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
     QSlider, QSplitter, QStackedLayout, QStackedWidget, QSystemTrayIcon, QTabBar, QVBoxLayout, QWidget,
 )
 
 from .api import BilibiliClient
+from .audio_files import AudioFiles
 from .catalog import normalize_library, merge_libraries, find_song, delete_song, copy_entries
 from .cards import CardArtwork, LibraryCard, LibraryGrid
 from .covers import CoverCache
 from .details import EntryDetailsDialog
 from .dialog_dimming import install_dialog_dimming
-from .dialogs import AlbumDialog, EntryDialog
-from .exchange import read_library, write_library
+from .dialogs import AlbumDialog, EntryDialog, ExportOptionsDialog
+from .exchange import read_library_package, write_library_package
+from .floating_lyrics import FloatingLyrics
 from .i18n import translate, translate_error
 from .list_dialog import ListImportDialog
 from .lyrics import LyricsStore
 from .mini_cover import CoverButton
 from .mini_lyrics import MiniLyrics
-from .models import DEFAULT_MINI_COVER_STYLE, MINI_COVER_STYLES, LibraryEntry, Store, Track
+from .models import AUDIO_EXTENSIONS, DEFAULT_MINI_COVER_STYLE, MINI_COVER_STYLES, LibraryEntry, Store, Track
 from .network import set_proxy, validate_proxy_url
 from .youtube import YouTubeClient, YouTubeError, read_youtube_cookie_file
 from .playback_order import ShuffleOrder
 from .window_chrome import TitleBar, FramelessController
+from .window_dialogs import exec_for_window, pick_files, prompt_text, show_message
 from .stream import StreamProxy
 from .settings_dialog import SettingsDialog
 from .widgets import PlaybackTitleLabel, SeekSlider
@@ -69,6 +73,57 @@ class Task(QRunnable):
             self.signals.error.emit(str(exc))
         finally:
             self.signals.finished.emit()
+
+
+class AudioDurationReader(QObject):
+    durationRead = pyqtSignal(str, int)
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._pending: dict[Path, None] = {}
+        self._current: Path | None = None
+        self._player = QMediaPlayer(self)
+        self._player.durationChanged.connect(self._duration_changed)
+        self._player.errorOccurred.connect(lambda *_: self._finish())
+        self._advance_timer = QTimer(self, singleShot=True)
+        self._advance_timer.timeout.connect(self._read_next)
+        self._timeout = QTimer(self, singleShot=True, interval=5000)
+        self._timeout.timeout.connect(self._finish)
+
+    def add(self, path: Path):
+        if path != self._current:
+            self._pending[path] = None
+            if self._current is None:
+                self._advance_timer.start(0)
+
+    def _read_next(self):
+        self._player.setSource(QUrl())
+        if not self._pending:
+            return
+        self._current = next(iter(self._pending))
+        del self._pending[self._current]
+        self._timeout.start()
+        self._player.setSource(QUrl.fromLocalFile(str(self._current)))
+
+    def _duration_changed(self, milliseconds):
+        if milliseconds > 0:
+            self._finish(max(1, milliseconds // 1000))
+
+    def _finish(self, seconds=0):
+        path, self._current = self._current, None
+        if path is None:
+            return
+        self._timeout.stop()
+        self._advance_timer.start(0)
+        if seconds:
+            self.durationRead.emit(path.name, seconds)
+
+    def stop(self):
+        self._current = None
+        self._pending.clear()
+        self._advance_timer.stop()
+        self._timeout.stop()
+        self._player.setSource(QUrl())
 
 
 def label(text: str = "", name: str = "") -> QLabel:
@@ -143,6 +198,14 @@ def media_icon(kind: str, theme: str, primary: bool = False) -> QIcon:
         path.closeSubpath()
         painter.drawPath(path)
         painter.drawRect(10, 14, 2, 6)
+    elif kind == "lyrics":
+        # Lucide Captions uses a 24 × 24 view box. See LICENSE for attribution.
+        painter.scale(22 / 24, 22 / 24)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(color, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawRoundedRect(QRectF(3, 5, 18, 14), 2, 2)
+        for left, right, y in ((7, 9, 11), (13, 17, 11), (7, 11, 15), (15, 17, 15)):
+            painter.drawLine(left, y, right, y)
     elif kind == "queue":
         for y in (4, 10, 16):
             painter.drawRoundedRect(3, y, 3, 3, 1, 1)
@@ -183,6 +246,8 @@ class PlayerPages(QStackedWidget):
 class MainWindow(QMainWindow):
     libraryChanged = pyqtSignal()
     lyricsChanged = pyqtSignal(str)
+    audioDownloadProgressChanged = pyqtSignal(str)
+    _audioDownloadProgressReported = pyqtSignal(str, object, int)
 
     def __init__(self, store_path: Path | None = None):
         super().__init__()
@@ -254,6 +319,11 @@ class MainWindow(QMainWindow):
         self._song_edit_requests = {}
         self._deferred_album_additions: dict[str, list] = {}
         self.covers = CoverCache(self.store.path.parent / "covers")
+        self.audio_files = AudioFiles(self.store.path.parent / "audio-files")
+        self._audio_duration_reader = AudioDurationReader(self)
+        self._audio_duration_reader.durationRead.connect(self._save_local_audio_duration)
+        self._audio_downloads: dict[str, tuple[object, int]] = {}
+        self._audioDownloadProgressReported.connect(self._update_audio_download_progress, Qt.ConnectionType.QueuedConnection)
         self.pool = QThreadPool.globalInstance()
         self.proxy = StreamProxy(self.store.path.parent / "audio-cache")
         self.audio = QAudioOutput(self)
@@ -266,6 +336,9 @@ class MainWindow(QMainWindow):
         apply_theme(QApplication.instance(), self.theme)
         self._build(volume)
         self._build_mini()
+        self.floating_lyrics = FloatingLyrics()
+        self.floating_lyrics.closed.connect(self.set_floating_lyrics_visible)
+        self.destroyed.connect(self.floating_lyrics.deleteLater)
         self._build_tray()
         self._append_tracks(tracks, persist=False)
         self.player.positionChanged.connect(self._position)
@@ -285,6 +358,7 @@ class MainWindow(QMainWindow):
         self.save_timer.timeout.connect(self._save)
         self.queue.model().rowsMoved.connect(self._queue_changed)
         self._retranslate()
+        self._read_local_audio_durations()
         if load_error:
             QTimer.singleShot(0, lambda: self._error(self.tr(
                 "无法读取音乐库，原文件已保留：\n{message}", message=load_error,
@@ -347,7 +421,11 @@ class MainWindow(QMainWindow):
         title_row.addWidget(self._text("我的音乐库", "heading"))
         title_row.addStretch()
         title_row.addWidget(self._button("＋ 新建专辑", self.new_album))
+        self.import_library_button = self._button("导入音乐库", self.import_library)
+        title_row.addWidget(self.import_library_button)
         title_row.addWidget(self._button("导入列表", self.import_list))
+        self.import_audio_button = self._button("导入本地音乐", self.import_local_audio)
+        title_row.addWidget(self.import_audio_button)
         title_row.addWidget(self._button("＋ 导入视频", self.add_entry, True))
         lib_layout.addLayout(title_row)
         filter_row = QHBoxLayout()
@@ -361,9 +439,6 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._render_library)
         filter_row.addWidget(self.tabs)
         filter_row.addStretch()
-        self.json_button = button("JSON", self.show_json_menu)
-        self._bind(self.json_button, "导入或导出全部曲目", "setToolTip")
-        filter_row.addWidget(self.json_button)
         self.search = QLineEdit()
         self._bind(self.search, "搜索名称 / BV", "setPlaceholderText")
         self.search.setClearButtonEnabled(True)
@@ -382,9 +457,8 @@ class MainWindow(QMainWindow):
             [entry.id for entry in self._selected_library_entries()]))
         self.batch_delete_button = self._button("删除", lambda: self.delete_library_entries(
             [entry.id for entry in self._selected_library_entries()]))
-        self.batch_export_button = self._button("批量导出", lambda: None)
+        self.batch_export_button = self._button("批量导出", self.export_selection)
         self.batch_export_button.setEnabled(False)
-        self._bind(self.batch_export_button, "暂未实现", "setToolTip")
         for widget in (self.exit_selection_button, self.select_all_button, self.batch_copy_button,
                        self.batch_delete_button, self.batch_export_button):
             batch_tools.addWidget(widget)
@@ -394,6 +468,7 @@ class MainWindow(QMainWindow):
         self.selection_tools.hide()
         lib_layout.addWidget(self.selection_tools)
         scroll = QScrollArea()
+        self.library_scroll = scroll
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.cards = LibraryGrid()
@@ -466,6 +541,10 @@ class MainWindow(QMainWindow):
         self.mode.setCurrentIndex(self._saved_play_mode if type(self._saved_play_mode) is int and 0 <= self._saved_play_mode < 4 else 0)
         self.mode.currentIndexChanged.connect(self._mode_changed)
         top.addWidget(self.mode)
+        self.floating_lyrics_button = self._button("歌词悬浮窗", self.set_floating_lyrics_visible)
+        self.floating_lyrics_button.setCheckable(True)
+        self.floating_lyrics_button.setObjectName("floatingLyricsToggle")
+        top.addWidget(self.floating_lyrics_button)
         top.addSpacing(10)
         top.addWidget(self._text("音量", "muted"))
         self.volume = QSlider(Qt.Orientation.Horizontal)
@@ -498,7 +577,15 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(20, 16, 20, 20)
         layout.setSpacing(12)
         header = QHBoxLayout()
-        header.addWidget(label("bili music", "section"))
+        self.mini_floating_lyrics_button = button("", self.set_floating_lyrics_visible)
+        self.mini_floating_lyrics_button.setCheckable(True)
+        self.mini_floating_lyrics_button.setFixedSize(36, 34)
+        self.mini_floating_lyrics_button.setIconSize(QSize(20, 20))
+        self.mini_floating_lyrics_button.setFlat(True)
+        self.mini_floating_lyrics_button.setProperty("flatIcon", True)
+        self._bind(self.mini_floating_lyrics_button, "歌词悬浮窗", "setToolTip")
+        self._bind(self.mini_floating_lyrics_button, "歌词悬浮窗", "setAccessibleName")
+        header.addWidget(self.mini_floating_lyrics_button)
         header.addStretch()
         self.mini_pin_button = self._make_pin_button()
         header.addWidget(self.mini_pin_button)
@@ -704,6 +791,7 @@ class MainWindow(QMainWindow):
         self.mini_cover.update()
         self.mini_previous.setIcon(media_icon("previous", self.theme))
         self.mini_next.setIcon(media_icon("next", self.theme))
+        self.mini_floating_lyrics_button.setIcon(media_icon("lyrics", self.theme))
         self.mini_queue_button.setIcon(media_icon("queue", self.theme))
         self._refresh_mode_button()
         self._refresh_pin_buttons()
@@ -781,31 +869,49 @@ class MainWindow(QMainWindow):
         track = item.data(Qt.ItemDataRole.UserRole)
         return track.song_id or track.id
 
-    def _refresh_mini_lyrics(self):
-        if self.mini_artwork.currentWidget() is not self.mini_lyrics:
+    def set_floating_lyrics_visible(self, visible=False):
+        if self._closing:
+            return
+        for control in (self.floating_lyrics_button, self.mini_floating_lyrics_button, self.floating_lyrics_action):
+            control.setChecked(visible)
+        if visible:
+            self.floating_lyrics.show_on_screen(self.screen())
+            self._refresh_lyrics_views()
+        else:
+            self.floating_lyrics.hide()
+
+    def _refresh_lyrics_views(self):
+        views = []
+        if self.mini_artwork.currentWidget() is self.mini_lyrics:
+            views.append(self.mini_lyrics)
+        if self.floating_lyrics.isVisible():
+            views.append(self.floating_lyrics)
+        if not views:
             return
         song_id = self._current_lyrics_song_id()
         entries, active_id = self.song_lyrics(song_id) if song_id else ((), None)
         active = next((entry for entry in entries if entry.id == active_id), None)
-        self.mini_lyrics.set_lyrics(active.display() if active else None,
-                                   self.tr("纯音乐" if active and active.instrumental else "暂无已保存歌词"))
-        self.mini_lyrics.set_position(self.player.position())
+        display = active.display() if active else None
+        placeholder = self.tr("纯音乐" if active and active.instrumental else "暂无已保存歌词")
+        for view in views:
+            view.set_lyrics(display, placeholder)
+            view.set_position(self.player.position())
 
     def _on_lyrics_changed(self, song_id):
         if song_id == self._current_lyrics_song_id():
-            self._refresh_mini_lyrics()
+            self._refresh_lyrics_views()
 
     def _toggle_mini_lyrics(self):
         if self.mini_artwork.currentWidget() is self.mini_cover:
             self.mini_artwork.setCurrentWidget(self.mini_lyrics)
-            self._refresh_mini_lyrics()
+            self._refresh_lyrics_views()
             self.mini_lyrics.setFocus()
         else:
             self.mini_artwork.setCurrentWidget(self.mini_cover)
             self.mini_cover.setFocus()
 
     def _update_current_cover(self, track=None):
-        self._refresh_mini_lyrics()
+        self._refresh_lyrics_views()
         # Detach the previous song's pending cover before reusing this artwork widget.
         self.mini_cover.set_pixmap(QPixmap())
         for waiters in self._cover_waiters.values():
@@ -834,6 +940,9 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         self._bind(menu.addAction(""), "显示播放器").triggered.connect(self.restore_window)
         self._bind(menu.addAction(""), "迷你播放器").triggered.connect(self.show_mini_player)
+        self.floating_lyrics_action = self._bind(menu.addAction(""), "歌词悬浮窗")
+        self.floating_lyrics_action.setCheckable(True)
+        self.floating_lyrics_action.triggered.connect(self.set_floating_lyrics_visible)
         menu.addSeparator()
         self._bind(menu.addAction(""), "播放 / 暂停（空格）").triggered.connect(self.toggle_play)
         self._bind(menu.addAction(""), "上一首").triggered.connect(self.previous)
@@ -880,13 +989,14 @@ class MainWindow(QMainWindow):
         for index, text in enumerate(("顺序播放", "列表循环", "单曲循环", "随机播放")):
             self.mode.setItemText(index, self.tr(text))
         self.title_bar.set_language(self.language)
+        self.floating_lyrics.set_language(self.language)
         self._refresh_mode_button()
         self._refresh_settings()
         if self.current_id is None:
             self.now_title.setText(self.tr("还没有正在播放的音乐"))
             self.now_meta.setText(self.tr("从音乐库点击播放"))
         self._sync_mini_text()
-        self._refresh_mini_lyrics()
+        self._refresh_lyrics_views()
         self._refresh_pin_buttons()
         self._status(*self._status_value[:1], **self._status_value[1])
         self._queue_changed(persist=False)
@@ -927,7 +1037,18 @@ class MainWindow(QMainWindow):
     def _card_drag_state(self, active: bool):
         self._library_drag_active = active
         if not active and self._library_render_pending and not self._closing:
-            QTimer.singleShot(0, self._render_library)
+            QTimer.singleShot(0, self._refresh_library_after_drag)
+
+    def _refresh_library_after_drag(self):
+        if self._closing or self._library_drag_active or not self._library_render_pending:
+            return
+        bar = self.library_scroll.verticalScrollBar()
+        position = bar.value()
+        focus = QApplication.focusWidget()
+        if focus is not None and self.cards.isAncestorOf(focus):
+            self.library_scroll.setFocus()
+        self._render_library()
+        bar.setValue(position)
 
     def _render_library(self, *_):
         if not hasattr(self, "grid") or self._closing:
@@ -939,10 +1060,14 @@ class MainWindow(QMainWindow):
         self.cards.clear()
         query = self.search.text().strip().lower()
         kind = {1: "album", 2: "single"}.get(self.tabs.currentIndex())
-        album_song_ids = {track.song_id or track.id for entry in self.entries if entry.kind == "album"
-                          for track in entry.tracks}
+        album_titles = {}
+        albums = sorted((entry for entry in self.entries if entry.kind == "album"),
+                        key=lambda entry: (entry.title.casefold(), entry.id))
+        for album in albums:
+            for track in album.tracks:
+                album_titles.setdefault(track.song_id or track.id, album.title)
         entries = [e for e in self.entries if (not kind or e.kind == kind)
-                   and (kind is not None or e.kind == "album" or e.id not in album_song_ids)
+                   and (kind is not None or e.kind == "album" or e.id not in album_titles)
                    and (query in e.title.lower() or query in e.bvid.lower())]
         self._visible_entry_ids = [e.id for e in entries]
         self._selected_entry_ids.intersection_update(self._visible_entry_ids)
@@ -976,14 +1101,16 @@ class MainWindow(QMainWindow):
             art.setToolTip(self.tr("打开专辑" if entry.kind == "album" else "打开单曲详情"))
             if entry.kind == "album":
                 subtitle = self.tr("专辑 · {count} 首", count=len(entry.tracks)) if entry.resolved else self.tr("专辑 · 等待导入")
-            elif entry.provider == "youtube":
-                subtitle = "YouTube"
             else:
-                subtitle = entry.tracks[0].artist if entry.tracks and entry.tracks[0].artist else self.tr("单曲 · P{page}", page=entry.page)
+                artist = entry.artist.strip()
+                if not artist and entry.tracks:
+                    artist = entry.tracks[0].artist.strip()
+                album_title = album_titles.get(entry.id, "").strip()
+                subtitle = " · ".join(filter(None, (album_title, artist))) or self.tr("单曲")
             card.set_content(art, entry.title, subtitle, self.tr("播放"))
             card.set_selection(self._selection_mode, entry.id in self._selected_entry_ids)
             card.selection_box.setAccessibleName(self.tr("选择 {title}", title=entry.title))
-            card.subtitle_label.setToolTip(subtitle + ("\n" + entry.bvid if entry.bvid else ""))
+            card.subtitle_label.setToolTip(subtitle + ("\n" + entry.bvid if entry.video_url else ""))
             if entry.cover:
                 self._load_cover(entry.cover, art)
             cards.append(card)
@@ -1010,7 +1137,7 @@ class MainWindow(QMainWindow):
             identity not in self._selected_entry_ids for identity in self._visible_entry_ids
         ))
         self.selection_count.setText(self.tr("已选择 {count} 项", count=len(self._selected_entry_ids)))
-        for widget in (self.batch_copy_button, self.batch_delete_button):
+        for widget in (self.batch_copy_button, self.batch_delete_button, self.batch_export_button):
             widget.setEnabled(bool(self._selected_entry_ids))
         for card in self.cards._cards:
             card.set_selection(self._selection_mode, card.entry_id in self._selected_entry_ids)
@@ -1084,7 +1211,7 @@ class MainWindow(QMainWindow):
             self._error(self.tr("还没有专辑，请先新建一个。"))
             return
         choices = [f"{index + 1}. {entry.title}" for index, entry in enumerate(albums)]
-        chosen, accepted = QInputDialog.getItem(self._dialog_host(), self.tr("加入专辑"), self.tr("请选择专辑"), choices, 0, False)
+        chosen, accepted = prompt_text(self._dialog_host(), self.tr("加入专辑"), self.tr("请选择专辑"), choices=choices)
         if accepted:
             album = albums[choices.index(chosen)]
             for identity in identities:
@@ -1145,7 +1272,14 @@ class MainWindow(QMainWindow):
             return
         source, target = indexes[source_id], indexes[target_id]
         self.entries[source], self.entries[target] = self.entries[target], self.entries[source]
-        self._render_library()
+        visible = set(self._visible_entry_ids)
+        ordered_ids = [entry.id for entry in self.entries if entry.id in visible]
+        if len(ordered_ids) == len(visible):
+            self.cards.reorder_cards(ordered_ids)
+            self._visible_entry_ids = ordered_ids
+        else:
+            self._library_render_pending = True
+            self._refresh_library_after_drag()
         self._save()
 
     def _load_cover(self, source: str, artwork):
@@ -1184,7 +1318,7 @@ class MainWindow(QMainWindow):
         self._settings_dialog = dialog
         try:
             self._refresh_settings()
-            dialog.exec()
+            exec_for_window(dialog)
         finally:
             self._settings_dialog = None
             if not sip.isdeleted(dialog):
@@ -1286,8 +1420,8 @@ class MainWindow(QMainWindow):
     def clear_audio_cache(self):
         if self._clearing_audio_cache:
             return
-        answer = QMessageBox.question(
-            self._dialog_host(), self.tr("清除音频缓存"),
+        answer = show_message(
+            self._dialog_host(), QMessageBox.Icon.Question, self.tr("清除音频缓存"),
             self.tr("清除已下载的音频缓存？音乐库和封面会保留；正在使用的缓存将在切歌或退出后清理。"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
@@ -1309,63 +1443,133 @@ class MainWindow(QMainWindow):
             self._error(self.tr("清除音频缓存失败：{message}", message=message))
         self._submit(self.proxy.clear_cache, done, failed)
 
-    def show_json_menu(self):
-        menu = QMenu(self)
-        menu.addAction(self.tr("导入 JSON 曲目…"), self.import_json)
-        menu.addAction(self.tr("导出全部曲目 JSON…"), self.export_json)
-        menu.exec(self.json_button.mapToGlobal(self.json_button.rect().bottomLeft()))
-        menu.deleteLater()
+    def export_selection(self):
+        entries = self._selected_library_entries()
+        if not self._selection_mode or not entries:
+            return
+        options = ExportOptionsDialog(self)
+        try:
+            if exec_for_window(options) != QDialog.DialogCode.Accepted:
+                return
+            export_downloads = options.include_downloads.isChecked()
+            export_lyrics = options.include_lyrics.isChecked()
+        finally:
+            options.deleteLater()
 
-    def export_json(self):
-        filename, _ = QFileDialog.getSaveFileName(
-            self, self.tr("导出全部曲目"), "bili-music-library.json", self.tr("JSON 文件 (*.json)"),
-        )
-        if filename:
-            self.export_json_path(Path(filename))
+        dialog = QFileDialog(self, self.tr("批量导出"), "bili-music-library.zip", self.tr("音乐库 ZIP 包 (*.zip)"))
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setDefaultSuffix("zip")
+        try:
+            if exec_for_window(dialog) == QDialog.DialogCode.Accepted:
+                self.export_selection_path(Path(dialog.selectedFiles()[0]), [entry.id for entry in entries],
+                                           include_downloads=export_downloads, include_lyrics=export_lyrics, background=True)
+        finally:
+            dialog.deleteLater()
 
-    def export_json_path(self, path: Path):
+    def export_selection_path(self, path: Path, identities: list[str], *, include_downloads=False, include_lyrics=False, background=False):
+        selected = set(identities)
+        identities = [entry.id for entry in self.entries if entry.id in selected]
+        if not identities:
+            return False
         if path.resolve() == self.store.path.resolve():
             self._error(self.tr("请选择其他路径，不能覆盖播放器正在使用的音乐库。"))
             return False
-        try:
-            write_library(path, self.entries)
-        except (ValueError, OSError) as exc:
-            self._error(self.tr("导出失败：{message}", message=str(exc)))
+        if path.resolve() == self.lyrics_store.path.resolve():
+            self._error(self.tr("请选择其他路径，不能覆盖播放器正在使用的歌词库。"))
             return False
-        self._status("已导出全部 {count} 项音乐库内容", count=len(self.entries))
+        entries = deepcopy(self.entries) if background else self.entries
+
+        def write():
+            write_library_package(path, entries, identities, covers=self.covers,
+                                  audio_files=self.audio_files, include_downloads=include_downloads,
+                                  lyrics_store=self.lyrics_store, include_lyrics=include_lyrics)
+
+        def done(_):
+            self._status("已导出所选 {count} 项", count=len(identities))
+
+        def failed(message):
+            self._error(self.tr("导出失败：{message}", message=translate_error(message, self.language)))
+
+        if background:
+            self._status("正在导出音乐库…")
+            self._submit(write, done, failed)
+        else:
+            try:
+                write()
+            except (ValueError, OSError) as exc:
+                failed(str(exc))
+                return False
+            done(None)
         return True
 
-    def import_json(self):
-        filename, _ = QFileDialog.getOpenFileName(
-            self, self.tr("导入 JSON 曲目"), "", self.tr("JSON 文件 (*.json)"),
-        )
-        if filename:
-            self.import_json_path(Path(filename))
+    def import_library(self):
+        files = pick_files(QFileDialog, self, self.tr("导入音乐库"), self.tr("音乐库 ZIP 包 (*.zip)"))
+        if files:
+            self.import_library_path(Path(files[0]), background=True)
 
-    def import_json_path(self, path: Path):
+    def import_library_path(self, path: Path, *, background=False):
+        def read():
+            lyrics = {}
+            entries = read_library_package(path, self.covers, self.audio_files, lyrics=lyrics)
+            return entries, lyrics
+
+        def failed(message):
+            self._error(self.tr("导入失败：{message}", message=translate_error(message, self.language)))
+
+        if background:
+            self._status("正在导入音乐库…")
+            self._submit(read, lambda result: self._commit_library_import(*result), failed)
+            return True
         try:
-            entries = read_library(path)
+            entries, lyrics = read()
         except (ValueError, OSError) as exc:
-            self._error(self.tr("导入失败：{message}", message=str(exc)))
+            failed(str(exc))
             return False
+        return self._commit_library_import(entries, lyrics)
+
+    def _commit_library_import(self, entries, lyrics):
         if not entries:
-            self._status("JSON 中没有可导入的曲目")
+            self._status("音乐库包中没有可导入的曲目")
             return True
         original = self.entries
-        from copy import deepcopy
         combined = deepcopy(original)
+        # A ZIP can replace an offline copy that has disappeared from disk.
+        incoming_ids = {entry.id for entry in entries if entry.kind == "single" and entry.tracks
+                        and entry.tracks[0].audio_file}
+        for entry in combined:
+            if entry.id in incoming_ids and entry.kind == "single" and entry.tracks:
+                track = entry.tracks[0]
+                if track.provider != "local" and track.audio_file and self.audio_files.path(track.audio_file) is None:
+                    track.audio_file = ""
         merge_libraries(combined, entries)
         self.entries = combined
         if not self._save():
             self.entries = original
             return False
         self._render_library()
-        self._status("已从 JSON 导入 {count} 项，已有曲目保留", count=len(entries))
+        self.libraryChanged.emit()
+        self._status("已导入 {count} 项，已有曲目保留", count=len(entries))
+        self._read_local_audio_durations()
+        imported = {entry.id: entry for entry in entries if entry.id in lyrics}
+        compatible = {
+            entry.id: lyrics[entry.id] for entry in self.entries
+            if entry.kind == "single" and entry.id in imported
+            and (entry.provider, entry.bvid, entry.page)
+            == (imported[entry.id].provider, imported[entry.id].bvid, imported[entry.id].page)
+        }
+        if compatible:
+            try:
+                self.lyrics_store.merge(compatible)
+            except (ValueError, OSError) as exc:
+                self._error(self.tr("曲目已导入，歌词保存失败：{message}", message=str(exc)))
+                return False
+            for song_id in compatible:
+                self.lyricsChanged.emit(song_id)
         return True
 
     def import_list(self):
         dialog = ListImportDialog(self)
-        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.import_result is not None:
+        if exec_for_window(dialog) == QDialog.DialogCode.Accepted and dialog.import_result is not None:
             self.commit_list_import(dialog.import_result)
 
     def commit_list_import(self, result):
@@ -1388,12 +1592,162 @@ class MainWindow(QMainWindow):
             message.setIcon(QMessageBox.Icon.Information)
             message.setText(self.tr("专辑已保存，跳过 {count} 个不可用视频。", count=len(result.skipped)))
             message.setDetailedText("\n".join(translate_error(reason, self.language) for reason in result.skipped))
-            message.exec()
+            exec_for_window(message)
 
     def add_entry(self):
         dialog = EntryDialog(self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if exec_for_window(dialog) == QDialog.DialogCode.Accepted:
             self.import_entry(dialog.value())
+
+    def import_local_audio(self):
+        patterns = " ".join(f"*.{extension}" for extension in AUDIO_EXTENSIONS)
+        filenames = pick_files(
+            QFileDialog, self, self.tr("导入本地音乐"), self.tr("音频文件 ({patterns})", patterns=patterns),
+            multiple=True,
+        )
+        if filenames:
+            self.import_local_audio_paths([Path(name) for name in filenames])
+
+    def import_local_audio_paths(self, paths: list[Path]):
+        def load():
+            songs, errors = [], []
+            for path in paths:
+                try:
+                    audio_file = self.audio_files.import_file(path)
+                except (OSError, ValueError) as exc:
+                    errors.append(f"{path.name} · {translate_error(str(exc), self.language)}")
+                    continue
+                identifier = uuid4().hex
+                title = path.stem
+                track = Track(title, identifier, 0, 1, provider="local", audio_file=audio_file)
+                songs.append(LibraryEntry(title, identifier, tracks=[track], resolved=True, provider="local"))
+            return songs, errors
+
+        def done(result):
+            songs, errors = result
+            if songs:
+                original = self.entries
+                self.entries = [*original, *songs]
+                if self._save():
+                    self._render_library()
+                    self._status("已导入 {count} 首本地歌曲", count=len(songs))
+                    self._read_local_audio_durations()
+                else:
+                    self.entries = original
+            if errors:
+                self._error(self.tr("部分音频文件导入失败：{message}", message="\n".join(errors)))
+
+        self._status("正在导入本地音乐…")
+        self._submit(load, done)
+
+    def _read_local_audio_durations(self):
+        tracks = [song.tracks[0] for song in self.entries if song.kind == "single" and song.tracks]
+        tracks.extend(self._tracks())
+        for name in dict.fromkeys(track.audio_file for track in tracks if not track.duration and track.audio_file):
+            path = self.audio_files.path(name)
+            if path is not None:
+                self._audio_duration_reader.add(path)
+
+    def _save_local_audio_duration(self, name: str, seconds: int):
+        updated = False
+        songs = {}
+        for entry in self.entries:
+            if entry.kind == "single" and entry.tracks and entry.tracks[0].audio_file == name:
+                track = entry.tracks[0]
+                songs[entry.id] = track
+                if not track.duration:
+                    track.duration = seconds
+                    updated = True
+        for track in self._tracks():
+            if track.duration:
+                continue
+            canonical = songs.get(track.song_id or track.id)
+            if track.audio_file == name or (
+                canonical is not None and self._audio_cache_identity(canonical)[1] == self._audio_cache_identity(track)[1]
+            ):
+                track.duration = seconds
+                updated = True
+        if updated:
+            self.save_timer.start(350)
+            self.libraryChanged.emit()
+
+    def local_audio_path(self, track: Track) -> Path | None:
+        song = find_song(self.entries, track.song_id or track.id)
+        if song and song.tracks:
+            canonical = song.tracks[0]
+            if self._audio_cache_identity(canonical)[1] == self._audio_cache_identity(track)[1]:
+                return self.audio_files.path(canonical.audio_file)
+        return self.audio_files.path(track.audio_file)
+
+    def audio_download_pending(self, entry: LibraryEntry) -> bool:
+        return entry.id in self._audio_downloads
+
+    def audio_download_progress(self, entry: LibraryEntry) -> int | None:
+        state = self._audio_downloads.get(entry.id)
+        return state[1] if state is not None else None
+
+    def _update_audio_download_progress(self, song_id, token, percent):
+        current = self._audio_downloads.get(song_id)
+        if not self._closing and current is not None and current[0] is token and current[1] != percent:
+            self._audio_downloads[song_id] = token, percent
+            self.audioDownloadProgressChanged.emit(song_id)
+
+    def download_audio(self, entry: LibraryEntry):
+        current = self._find(entry.id)
+        if (current is None or current.kind != "single" or current.provider == "local"
+                or not current.tracks or self.audio_download_pending(current)):
+            return
+        track = replace(current.tracks[0])
+        if self.local_audio_path(track) is not None:
+            return
+        identity = current.id
+        cache_key, source_key = self._audio_cache_identity(track)
+        token = object()
+        self._audio_downloads[identity] = token, -1
+        self._status("正在下载 {title}…", title=current.title)
+        self.libraryChanged.emit()
+
+        def resolve():
+            client = self._source_client(track)
+            return client.get_stream(track, audio_only=True) if track.provider == "bilibili" else client.get_stream(track)
+
+        last_percent = -1
+
+        def report(written, total):
+            nonlocal last_percent
+            percent = min(100, written * 100 // total) if total else -1
+            if percent != last_percent:
+                last_percent = percent
+                self._audioDownloadProgressReported.emit(identity, token, percent)
+
+        def save(content_type, chunks, **kwargs):
+            return self.audio_files.store_stream(content_type, chunks, progress=report, **kwargs)
+
+        def load():
+            # Bilibili playback can fall back to a video stream. Resolve its audio-only format first.
+            return self.proxy.download_audio(cache_key, source_key, resolve, save,
+                                             allow_cached=track.provider == "youtube")
+
+        def done(audio_file):
+            self._audio_downloads.pop(identity, None)
+            song = self._find(identity)
+            if song and song.tracks and self._audio_cache_identity(song.tracks[0])[1] == source_key:
+                canonical = song.tracks[0]
+                previous = canonical.audio_file
+                canonical.audio_file = audio_file
+                if self._save():
+                    self._status("已下载 {title}，可以离线播放", title=song.title)
+                    self._read_local_audio_durations()
+                else:
+                    canonical.audio_file = previous
+            self.libraryChanged.emit()
+
+        def failed(message):
+            self._audio_downloads.pop(identity, None)
+            self.libraryChanged.emit()
+            self._error(self.tr("下载音频失败：{message}", message=translate_error(message, self.language)))
+
+        self._submit(load, done, failed)
 
     def _source_client(self, entry):
         if entry.provider == "youtube":
@@ -1424,7 +1778,7 @@ class MainWindow(QMainWindow):
 
     def new_album(self, _checked=False, title: str | None = None):
         if title is None:
-            title, accepted = QInputDialog.getText(self, self.tr("新建空专辑"), self.tr("专辑名称"))
+            title, accepted = prompt_text(self, self.tr("新建空专辑"), self.tr("专辑名称"))
             if not accepted or not title.strip():
                 return None
         title = title.strip()
@@ -1452,7 +1806,7 @@ class MainWindow(QMainWindow):
         return direct or find_song(self.entries, identity)
 
     def _ensure_entry(self, entry: LibraryEntry, done, failed=None):
-        if entry.resolved:
+        if entry.resolved or entry.provider == "local":
             done(entry)
             return
         source = (entry.provider, entry.bvid, entry.page, entry.kind)
@@ -1504,7 +1858,7 @@ class MainWindow(QMainWindow):
             dialog = (EntryDetailsDialog(self, current) if host is self else
                       EntryDetailsDialog(host, current, owner=self))
             try:
-                dialog.exec()
+                exec_for_window(dialog)
             finally:
                 if not sip.isdeleted(dialog):
                     dialog.deleteLater()
@@ -1532,7 +1886,7 @@ class MainWindow(QMainWindow):
             self._editing_albums.add(album.id)
             try:
                 dialog = AlbumDialog(self._dialog_host(), album, [e for e in self.entries if e.kind == "single"])
-                if dialog.exec() == QDialog.DialogCode.Accepted:
+                if exec_for_window(dialog) == QDialog.DialogCode.Accepted:
                     self.save_album(dialog.value())
             finally:
                 self._editing_albums.discard(album.id)
@@ -1607,7 +1961,7 @@ class MainWindow(QMainWindow):
             self._error(self.tr("还没有专辑，请先新建一个。"))
             return
         choices = [f"{i + 1}. {e.title}" for i, e in enumerate(albums)]
-        chosen, accepted = QInputDialog.getItem(self._dialog_host(), self.tr("加入专辑"), self.tr("请选择专辑"), choices, 0, False)
+        chosen, accepted = prompt_text(self._dialog_host(), self.tr("加入专辑"), self.tr("请选择专辑"), choices=choices)
         if accepted:
             self.add_single_to_album(entry, albums[choices.index(chosen)])
 
@@ -1621,8 +1975,11 @@ class MainWindow(QMainWindow):
             if canonical is None:
                 canonical = replace(candidate, id=song.id, song_id=song.id)
             else:
+                old_source = self._audio_cache_identity(canonical)[1]
                 canonical.provider = candidate.provider
                 canonical.bvid, canonical.cid, canonical.page = candidate.bvid, candidate.cid, candidate.page
+                if old_source != self._audio_cache_identity(candidate)[1]:
+                    canonical.audio_file = candidate.audio_file
                 canonical.duration = candidate.duration
             canonical.title, canonical.artist, canonical.date = updated.title, updated.artist, updated.date
             canonical.id = canonical.song_id = song.id
@@ -1659,7 +2016,7 @@ class MainWindow(QMainWindow):
         if current is None or current.kind != "single":
             return
         dialog = EntryDialog(self._dialog_host(), current)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        if exec_for_window(dialog) != QDialog.DialogCode.Accepted:
             return
         updated = dialog.value()
         if updated.cover and updated.cover != current.cover and not updated.cover.startswith(("http://", "https://")):
@@ -1698,7 +2055,7 @@ class MainWindow(QMainWindow):
         remove = message.addButton(self.tr("一并删除单曲"), QMessageBox.ButtonRole.DestructiveRole)
         message.addButton(QMessageBox.StandardButton.Cancel)
         message.setDefaultButton(keep)
-        message.exec()
+        exec_for_window(message)
         if message.clickedButton() == keep:
             return "keep"
         if message.clickedButton() == remove:
@@ -1753,9 +2110,10 @@ class MainWindow(QMainWindow):
         action("copy", "复制", lambda: self.copy_library_entries([entry.id]))
         if entry.kind == "single":
             action("add_album", "加入专辑…", lambda: self._choose_album(entry))
-        web = action("source", "在 YouTube 打开" if entry.provider == "youtube" else "在 B站打开",
-                     lambda: QDesktopServices.openUrl(QUrl(entry.video_url)))
-        web.setEnabled(bool(entry.bvid))
+        if entry.provider != "local":
+            web = action("source", "在 YouTube 打开" if entry.provider == "youtube" else "在 B站打开",
+                         lambda: QDesktopServices.openUrl(QUrl(entry.video_url)))
+            web.setEnabled(bool(entry.bvid))
         menu.addSeparator()
         action("delete", "从音乐库删除", lambda: self.delete_entry(entry))
         return menu
@@ -1887,8 +2245,6 @@ class MainWindow(QMainWindow):
         self.now_meta.setText(track.artist.strip())
         self._sync_mini_text()
         self._update_current_cover(track)
-        self._status("正在获取音频地址…")
-
         self._load_stream(track)
 
     def _reset_playback_recovery(self):
@@ -1909,19 +2265,19 @@ class MainWindow(QMainWindow):
         self._loading_stream = True
         self._last_progress_at = time.monotonic()
 
-        def ready(local_url, cached=False):
-            self.player.setSource(QUrl(local_url))
+        def ready(url, status):
             self._loading_stream = False
+            self.player.setSource(QUrl(url))
             self._last_progress_at = time.monotonic()
             QTimer.singleShot(0, self._resume_stream)
             if self._want_playing:
                 self.player.play()
-                self._status("正在播放缓存音频" if cached else "正在缓冲音频…")
+                self._status(status)
 
         def done(url):
             if request != self._request or track.id != self.current_id:
                 return
-            ready(self.proxy.set_stream(url, cache_key=cache_key, source_key=source_key))
+            ready(self.proxy.set_stream(url, cache_key=cache_key, source_key=source_key), "正在缓冲音频…")
 
         def failed(message):
             if request != self._request or track.id != self.current_id:
@@ -1933,12 +2289,22 @@ class MainWindow(QMainWindow):
                 self._want_playing = False
                 self._error(message)
 
+        local = self.local_audio_path(track)
+        if local is not None:
+            self.proxy.release_stream()
+            ready(QUrl.fromLocalFile(str(local)), "正在播放本地音频")
+            return
+        if track.provider == "local":
+            failed(self.tr("找不到本地音频文件"))
+            return
+        if not self._reconnect_attempts:
+            self._status("正在获取音频地址…")
         try:
             cached_url = self.proxy.get_cached_stream(cache_key, source_key)
         except OSError:
             cached_url = None
         if cached_url is not None:
-            ready(cached_url, cached=True)
+            ready(cached_url, "正在播放缓存音频")
             return
         self._submit(lambda: self._source_client(track).get_stream(track), done, failed)
 
@@ -1952,6 +2318,11 @@ class MainWindow(QMainWindow):
     def _recover_stream(self):
         row = self._current_row()
         if self._closing or not self._want_playing or row < 0 or self._loading_stream:
+            return
+        if self.player.source().isLocalFile():
+            self._want_playing = False
+            self.player.pause()
+            self._status("本地音频播放中断")
             return
         if self._reconnect_attempts >= 3:
             self._want_playing = False
@@ -2108,6 +2479,8 @@ class MainWindow(QMainWindow):
                 self._last_progress_at = time.monotonic()
             self._last_played_position = position
         self.mini_lyrics.set_position(position)
+        if self.floating_lyrics.isVisible():
+            self.floating_lyrics.set_position(position)
         for slider, elapsed in ((self.seek, self.elapsed), (self.mini_seek, self.mini_elapsed)):
             if not slider.isSliderDown():
                 slider.setValue(position)
@@ -2142,7 +2515,10 @@ class MainWindow(QMainWindow):
 
     def _media_error(self, error, message):
         if error != QMediaPlayer.Error.NoError and self.current_id:
-            if self._want_playing:
+            if self.player.source().isLocalFile():
+                self._want_playing = False
+                self._status("本地音频播放失败：{message}", message=message)
+            elif self._want_playing:
                 self._recover_stream()
             else:
                 self._status("播放失败：{message}。可重新双击歌曲获取地址。", message=message)
@@ -2174,7 +2550,7 @@ class MainWindow(QMainWindow):
     def _error(self, message: str):
         message = translate_error(message, self.language)
         self.status.setText(message.replace("\n", " "))
-        QMessageBox.warning(self._dialog_host(), "Bili Music", message)
+        show_message(self._dialog_host(), QMessageBox.Icon.Warning, "Bili Music", message)
 
     def closeEvent(self, event):
         if not self._quitting and QSystemTrayIcon.isSystemTrayAvailable():
@@ -2185,6 +2561,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._closing = True
+        self.floating_lyrics.close()
+        self._audio_duration_reader.stop()
         self._frameless_controller.dispose()
         self._set_mini_queue_open(False)
         self.playback_watchdog.stop()

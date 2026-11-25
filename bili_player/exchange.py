@@ -1,19 +1,29 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import tempfile
+import zipfile
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from .models import LibraryEntry, Track
+
+if TYPE_CHECKING:
+    from .audio_files import AudioFiles
+    from .covers import CoverCache
+    from .lyrics import LyricsStore, SongLyrics
 
 
 _FORMAT = "bili-music-library"
 _VERSION = 3
 _MAX_FILE_BYTES = 16 * 1024 * 1024
+_LYRICS_MEMBER = "lyrics.json"
 
 
 def _cover_url(value: str) -> str:
@@ -59,7 +69,11 @@ def _entry_from_dict(item: object) -> LibraryEntry:
 
 def dumps_library(entries: list[LibraryEntry]) -> str:
     """Export a detached graph with URL covers / 导出独立图结构及网址封面。"""
-    from .catalog import encode_library, normalize_library
+    return _dump_library(_export_entries(entries))
+
+
+def _export_entries(entries: list[LibraryEntry], entry_ids: list[str] | None = None) -> list[LibraryEntry]:
+    from .catalog import normalize_library
 
     if not isinstance(entries, list) or any(not isinstance(entry, LibraryEntry) for entry in entries):
         raise ValueError("音乐库条目必须是 LibraryEntry 列表")
@@ -70,9 +84,33 @@ def dumps_library(entries: list[LibraryEntry]) -> str:
         if not isinstance(entry.tracks, list) or any(not isinstance(track, Track) for track in entry.tracks):
             raise ValueError("专辑曲目必须是 Track 列表")
         _entry_from_dict(asdict(entry))
-        entry.cover = _cover_url(entry.cover)
     normalize_library(detached)
-    encoded = encode_library(detached)
+    if entry_ids is not None:
+        selected = set(entry_ids)
+        included = selected | {track.song_id for entry in detached if entry.id in selected and entry.kind == "album"
+                               for track in entry.tracks}
+        detached = [entry for entry in detached if entry.id in included]
+    return detached
+
+
+def _dump_library(entries, *, cover_reference=_cover_url, audio_reference=None) -> str:
+    from .catalog import encode_library
+
+    for entry in entries:
+        entry.cover = cover_reference(entry.cover)
+        if entry.kind == "single" and entry.tracks:
+            track = entry.tracks[0]
+            if audio_reference is not None:
+                track.audio_file = audio_reference(track)
+            elif track.provider == "local":
+                raise ValueError("本地单曲需要使用 ZIP 包导出")
+            else:
+                track.audio_file = ""
+    encoded = encode_library(entries)
+    for item in encoded["entries"]:
+        for track in item.get("tracks", []):
+            if not track.get("audio_file"):
+                track.pop("audio_file", None)
     payload = {"format": _FORMAT, "version": _VERSION, "entries": encoded["entries"]}
     if "songs" in encoded:
         payload["songs"] = encoded["songs"]
@@ -86,6 +124,10 @@ def dumps_library(entries: list[LibraryEntry]) -> str:
 
 def loads_library(text: str) -> list[LibraryEntry]:
     """Validate and load an ID-preserving graph / 验证并载入保留 ID 的图结构。"""
+    return _load_library(text)
+
+
+def _load_library(text, *, cover_reference=_cover_url, package=False) -> list[LibraryEntry]:
     from .catalog import decode_library, normalize_library
 
     if not isinstance(text, str):
@@ -99,6 +141,8 @@ def loads_library(text: str) -> list[LibraryEntry]:
     version = payload.get("version")
     if type(version) is not int:
         raise ValueError("音乐库版本必须是整数")
+    if package and (payload.get("format") != _FORMAT or version != _VERSION):
+        raise ValueError("不支持的音乐库包格式")
     if "format" in payload:
         if payload["format"] != _FORMAT:
             raise ValueError("不支持的音乐库格式")
@@ -120,7 +164,11 @@ def loads_library(text: str) -> list[LibraryEntry]:
     except (TypeError, KeyError) as exc:
         raise ValueError("音乐库条目或曲目的字段不正确，请检查必填字段和额外字段") from exc
     for entry in entries:
-        entry.cover = _cover_url(entry.cover)
+        entry.cover = cover_reference(entry.cover)
+        if not package and entry.kind == "single" and entry.tracks:
+            if entry.tracks[0].provider == "local":
+                raise ValueError("本地单曲需要使用 ZIP 包导入")
+            entry.tracks[0].audio_file = ""
         if entry.kind == "album" and entry.bvid == "":
             entry.resolved = True
     normalize_library(entries)
@@ -163,3 +211,172 @@ def write_library(path: Path, entries: list[LibraryEntry]) -> None:
     finally:
         if temporary is not None:
             Path(temporary).unlink(missing_ok=True)
+
+
+def write_library_package(
+    path: Path, entries: list[LibraryEntry], entry_ids: list[str], *,
+    covers: CoverCache | None = None, audio_files: AudioFiles | None = None,
+    include_downloads: bool = False, lyrics_store: LyricsStore | None = None,
+    include_lyrics: bool = False,
+) -> None:
+    """Embed covers, eligible audio, and optionally saved lyrics for selected music."""
+    from .audio_files import AudioFiles, CHUNK_SIZE, MAX_AUDIO_BYTES
+    from .covers import CoverCache, MAX_IMAGE_BYTES
+
+    selected = _export_entries(entries, entry_ids)
+    lyrics_data = b""
+    if include_lyrics:
+        from .lyrics import dumps_lyrics
+
+        if lyrics_store is None:
+            raise ValueError("导出歌词需要歌词存储")
+        song_ids = (entry.id for entry in selected if entry.kind == "single")
+        try:
+            snapshot = lyrics_store.load_many(song_ids)
+            if snapshot:
+                lyrics_data = dumps_lyrics(snapshot).encode("utf-8")
+        except (ValueError, OSError, RecursionError) as exc:
+            raise ValueError("无法读取已保存的歌词") from exc
+        if len(lyrics_data) > _MAX_FILE_BYTES:
+            raise ValueError("歌词文件过大，最大支持 16 MiB")
+
+    covers = covers if covers is not None else CoverCache(path.parent / "covers")
+    audio_files = audio_files if audio_files is not None else AudioFiles(path.parent / "audio-files")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            with zipfile.ZipFile(handle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                references = {}
+                members = set()
+
+                def add_cover(source):
+                    if not source.strip():
+                        return ""
+                    if source not in references:
+                        try:
+                            with covers.fetch(_cover_url(source) or source).open("rb") as image:
+                                data = image.read(MAX_IMAGE_BYTES + 1)
+                        except (OSError, ValueError) as exc:
+                            raise ValueError("无法打包封面，请检查网络或封面文件") from exc
+                        if len(data) > MAX_IMAGE_BYTES:
+                            raise ValueError("封面图片超过 8 MB")
+                        member = f"covers/{hashlib.sha256(data).hexdigest()}.img"
+                        if member not in members:
+                            archive.writestr(member, data)
+                            members.add(member)
+                        references[source] = member
+                    return references[source]
+
+                def add_audio(track):
+                    if track.provider != "local" and (not include_downloads or not track.audio_file):
+                        return ""
+                    source = audio_files.path(track.audio_file)
+                    if source is None:
+                        raise ValueError("找不到本地音频文件")
+                    member = f"audio/{track.audio_file}"
+                    if member not in members:
+                        digest = hashlib.sha256()
+                        size = 0
+                        # Store audio directly; most formats are already compressed.
+                        with source.open("rb") as audio, archive.open(zipfile.ZipInfo(member), "w", force_zip64=True) as output:
+                            while chunk := audio.read(CHUNK_SIZE):
+                                size += len(chunk)
+                                if size > MAX_AUDIO_BYTES:
+                                    raise ValueError("音频文件必须非空且不超过 1 GiB")
+                                digest.update(chunk)
+                                output.write(chunk)
+                        if digest.hexdigest() != source.stem:
+                            raise ValueError("音乐库包的音频校验失败")
+                        members.add(member)
+                    return track.audio_file
+
+                payload = _dump_library(selected, cover_reference=add_cover, audio_reference=add_audio).encode("utf-8")
+                if len(payload) > _MAX_FILE_BYTES:
+                    raise ValueError("音乐库文件过大，最大支持 16 MiB")
+                archive.writestr("library.json", payload)
+                if lyrics_data:
+                    archive.writestr(_LYRICS_MEMBER, lyrics_data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def read_library_package(
+    path: Path, covers: CoverCache, audio_files: AudioFiles | None = None, *,
+    lyrics: dict[str, SongLyrics] | None = None,
+) -> list[LibraryEntry]:
+    """Restore media and optionally collect validated lyrics for a later library commit."""
+    from .audio_files import AudioFiles, CHUNK_SIZE, MAX_AUDIO_BYTES
+    from .covers import MAX_IMAGE_BYTES
+
+    audio_files = audio_files if audio_files is not None else AudioFiles(covers.directory.parent / "audio-files")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            listed = archive.namelist()
+            names = set(listed)
+            if len(names) != len(listed):
+                raise ValueError("音乐库包中存在重复文件")
+            if "library.json" not in names:
+                raise ValueError("音乐库包缺少曲目数据")
+
+            def read_member(member, limit, error):
+                if archive.getinfo(member).file_size > limit:
+                    raise ValueError(error)
+                with archive.open(member) as file:
+                    data = file.read(limit + 1)
+                if len(data) > limit:
+                    raise ValueError(error)
+                return data
+
+            restored = {}
+
+            def restore_cover(source):
+                url = _cover_url(source)
+                if url or not source:
+                    return url
+                match = re.fullmatch(r"covers/([0-9a-f]{64})\.img", source)
+                if not match or source not in names:
+                    raise ValueError("音乐库包的封面引用无效")
+                if source not in restored:
+                    data = read_member(source, MAX_IMAGE_BYTES, "封面图片超过 8 MB")
+                    if hashlib.sha256(data).hexdigest() != match.group(1):
+                        raise ValueError("音乐库包的封面校验失败")
+                    restored[source] = str(covers.store_image(data).resolve())
+                return restored[source]
+
+            data = read_member("library.json", _MAX_FILE_BYTES, "音乐库文件过大，最大支持 16 MiB")
+            entries = _load_library(data.decode("utf-8-sig"), package=True, cover_reference=lambda source: source)
+            bundled_lyrics = {}
+            if _LYRICS_MEMBER in names:
+                from .lyrics import loads_lyrics
+
+                data = read_member(_LYRICS_MEMBER, _MAX_FILE_BYTES, "歌词文件过大，最大支持 16 MiB")
+                try:
+                    bundled_lyrics = loads_lyrics(data.decode("utf-8-sig"),
+                                                 {entry.id for entry in entries if entry.kind == "single"})
+                except (ValueError, RecursionError) as exc:
+                    raise ValueError("音乐库包的歌词数据无效") from exc
+            audio_names = {entry.tracks[0].audio_file for entry in entries if entry.kind == "single"
+                           and entry.tracks and entry.tracks[0].audio_file}
+            for name in sorted(audio_names):
+                member = f"audio/{name}"
+                if member not in names:
+                    raise ValueError("音乐库包的音频引用无效")
+                size = archive.getinfo(member).file_size
+                if not 0 < size <= MAX_AUDIO_BYTES:
+                    raise ValueError("音频文件必须非空且不超过 1 GiB")
+                with archive.open(member) as audio:
+                    audio_files.store(iter(lambda: audio.read(CHUNK_SIZE), b""), name.rsplit(".", 1)[1],
+                                      size=size, expected=name)
+            for entry in entries:
+                entry.cover = restore_cover(entry.cover)
+        if lyrics is not None:
+            lyrics.update(bundled_lyrics)
+        return entries
+    except (zipfile.BadZipFile, NotImplementedError, RuntimeError, UnicodeError) as exc:
+        raise ValueError("无法读取音乐库 ZIP 包") from exc

@@ -93,7 +93,7 @@ class AlbumDialogTests(unittest.TestCase):
         self.client = self.client_patch.start().return_value
         self.client.get_video.side_effect = AssertionError("Unexpected get_video call")
         self.client.get_tracks.side_effect = AssertionError("Unexpected get_tracks call")
-        self.warning_patch = patch("bili_player.dialogs.QMessageBox.warning")
+        self.warning_patch = patch("bili_player.dialogs.show_message")
         self.warning = self.warning_patch.start()
         self.addCleanup(self.client_patch.stop)
         self.addCleanup(self.warning_patch.stop)
@@ -596,7 +596,7 @@ class AlbumDialogTests(unittest.TestCase):
         self.parent.jobs[0][2]("Offline")
         self.assertTrue(dialog.save_button.isEnabled())
         self.warning.assert_called_once()
-        title, message = self.warning.call_args.args[1:]
+        title, message = self.warning.call_args.args[2:]
         self.assertEqual(title, "Operation failed")
         self.assertEqual(message, "Could not complete the operation. Try again later.\nOffline")
         self.warning.reset_mock()

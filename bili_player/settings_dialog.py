@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
 
 from .mini_cover import mini_cover_preview
 from .models import MINI_COVER_STYLES
+from .window_dialogs import pick_files
 
 
 class SettingsDialog(QDialog):
@@ -195,12 +196,12 @@ class SettingsDialog(QDialog):
 
     def _choose_youtube_cookie_file(self):
         tr = self.owner.tr
-        filename, _ = QFileDialog.getOpenFileName(
-            self, tr("选择 YouTube Cookie 文件"), self.owner.youtube_cookie_file,
-            tr("Cookie 文本文件 (*.txt);;所有文件 (*)"),
+        files = pick_files(
+            QFileDialog, self, tr("选择 YouTube Cookie 文件"), tr("Cookie 文本文件 (*.txt);;所有文件 (*)"),
+            directory=self.owner.youtube_cookie_file,
         )
-        if filename:
-            self._apply_youtube_cookie_file(filename)
+        if files:
+            self._apply_youtube_cookie_file(files[0])
 
     def _apply_youtube_cookie_file(self, filename):
         self._youtube_cookie_error = self.owner.set_youtube_cookie_file(filename) or ""

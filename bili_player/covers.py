@@ -48,9 +48,18 @@ class CoverCache:
             destination = self.directory / (digest + ".img")
             if destination.is_file() and not QImage(str(destination)).isNull():
                 return destination
+        return self.store_image(data, destination=destination)
+
+    def store_image(self, data: bytes, *, destination: Path | None = None) -> Path:
+        if len(data) > MAX_IMAGE_BYTES:
+            raise ValueError("封面图片超过 8 MB")
         image = QImage.fromData(data)
         if image.isNull() or image.width() * image.height() > 16_000_000:
             raise ValueError("封面不是有效图片或尺寸过大")
+        if destination is None:
+            destination = self.directory / (hashlib.sha256(data).hexdigest() + ".img")
+            if destination.is_file() and not QImage(str(destination)).isNull():
+                return destination
         self.directory.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:

@@ -106,7 +106,7 @@ class BilibiliClient:
             raise BilibiliError(f"视频分 P 数据不完整：{exc}") from exc
         return VideoInfo(title=title, cover=cover, tracks=tracks)
 
-    def get_stream(self, track: Track) -> str:
+    def get_stream(self, track: Track, *, audio_only: bool = False) -> str:
         data = self._get(_PLAY_URL, {
             "bvid": track.bvid, "cid": track.cid, "fnval": 16,
             "fnver": 0, "fourk": 0, "qn": 64,
@@ -121,6 +121,8 @@ class BilibiliClient:
                 url = self._stream_url(item)
                 if url:
                     return url
+        if audio_only:
+            raise BilibiliError("没有找到可下载的纯音频")
         durl = data.get("durl")
         if isinstance(durl, list):
             for item in durl:
